@@ -1,0 +1,43 @@
+# Core
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Async
+asyncio==3.4.3
+aiofiles==24.1.0
+
+# Web Scraping
+playwright==1.48.0
+playwright-stealth==1.0.6
+cloudscraper==1.2.71
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+aiosqlite==0.22.1
+alembic==1.14.0
+psycopg2-binary==2.9.10
+redis==5.2.0
+aioredis==2.0.1
+
+# API
+fastapi==0.115.4
+uvicorn==0.32.0
+httpx==0.28.0
+websockets==14.1
+
+# Telegram
+aiogram==3.14.0
+
+# Scheduling
+apscheduler==3.10.4
+
+# Logging
+loguru==0.7.2
+
+# Utils
+pendulum==3.0.0
+pytz==2024.2
+orjson==3.10.11
+tenacity==9.0.0

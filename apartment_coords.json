@@ -1,0 +1,214 @@
+{
+  "apartments": [
+    {
+      "name": "Seoul Towers",
+      "nav": "1/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Dream Tower",
+      "nav": "2/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "South Seas 2",
+      "nav": "3/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Vespucci APTS",
+      "nav": "4/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Eclipse Towers",
+      "nav": "5/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "1564 San Vitus",
+      "nav": "6/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "1563 San Vitus",
+      "nav": "7/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Galileo House",
+      "nav": "8/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Eclipse Medical Tower",
+      "nav": "9/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "The Royale APTS",
+      "nav": "10/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Integrity APTS",
+      "nav": "11/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Elgin House 2",
+      "nav": "12/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "La Puerta Pink APTS",
+      "nav": "13/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "South Seas 1",
+      "nav": "14/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "0605 Laguna Place",
+      "nav": "15/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Elgin House",
+      "nav": "16/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Weazel Plaza",
+      "nav": "17/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Wiwang APTS",
+      "nav": "18/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Trident APTS 2",
+      "nav": "19/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Trident APTS 3",
+      "nav": "20/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Celltowa",
+      "nav": "21/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Crastenburg East APTS",
+      "nav": "22/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Spanish Avenue APTS",
+      "nav": "23/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "La Puerta APTS",
+      "nav": "24/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "La Puerta Yellow APTS",
+      "nav": "25/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "0604 Laguna Place",
+      "nav": "26/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "South Seas 3",
+      "nav": "27/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Trident APTS 1",
+      "nav": "28/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Lady Raes APTS",
+      "nav": "29/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "0601 Alta Street",
+      "nav": "30/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Del Perro Heights",
+      "nav": "31/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Crastenburg West APTS",
+      "nav": "32/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Hedera",
+      "nav": "33/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Milton Road APTS",
+      "nav": "34/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    },
+    {
+      "name": "Tinsel Towers",
+      "nav": "35/35",
+      "badge": "АПАРТАМЕНТЫ",
+      "coords": null
+    }
+  ]
+}

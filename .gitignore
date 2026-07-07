@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.manifest
+*.spec
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Playwright
+user-data/
+browser-data/
+
+# Docker
+docker-compose.override.yml
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+
+# System
+.DS_Store
+Thumbs.db
+*.pid
+*.seed
+
+# Distributions
+*.tar.gz
+*.zip
+*.whl
+
+# Data exports
+data/
+exports/

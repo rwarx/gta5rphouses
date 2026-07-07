@@ -1,0 +1,26 @@
+{
+  "name": "apartment-checker-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-scripts": "5.0.1",
+    "axios": "^1.7.7",
+    "recharts": "^2.13.0",
+    "react-router-dom": "^6.27.0",
+    "antd": "^5.21.0",
+    "@ant-design/icons": "^5.5.1",
+    "dayjs": "^1.11.13"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
+  }
+}

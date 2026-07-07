@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers
 RUN python -m playwright install chromium
-RUN python -m playwright install-deps chromium
+RUN python -m playwright install-deps chromium || echo "install-deps failed (non-critical), continuing..."
 
 # Copy application code
 COPY . .

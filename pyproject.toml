@@ -1,6 +1,6 @@
 [project]
 name = "apartment-checker"
-version = "1.0.0"
+version = "1.1.0"
 description = "GTA5RP Apartment Monitoring System"
 requires-python = ">=3.12"
 

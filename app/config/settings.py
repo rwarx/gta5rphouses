@@ -32,6 +32,11 @@ class DatabaseSettings:
 
     def __init__(self):
         _root = Path(__file__).resolve().parent.parent.parent
+
+        # Railway provides postgresql:// but we need postgresql+asyncpg://
+        if self.database_url.startswith("postgresql://") and "+" not in self.database_url.split("://")[0]:
+            self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
         for attr in ("database_url", "database_sync_url"):
             url = getattr(self, attr)
             if url.startswith("sqlite"):

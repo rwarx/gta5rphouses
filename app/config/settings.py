@@ -27,7 +27,7 @@ def env(key: str, default: str = "") -> str:
 class DatabaseSettings:
     """Database connection settings."""
     database_url: str = env("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/apartment_checker")
-    database_sync_url: str = env("DATABASE_SYNC_URL", "postgresql://postgres:postgres@localhost:5432/apartment_checker")
+    database_sync_url: str = env("DATABASE_SYNC_URL", "")
     redis_url: str = env("REDIS_URL", "redis://localhost:6379/0")
 
     def __init__(self):
@@ -36,6 +36,10 @@ class DatabaseSettings:
         # Railway provides postgresql:// but we need postgresql+asyncpg://
         if self.database_url.startswith("postgresql://") and "+" not in self.database_url.split("://")[0]:
             self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        # Derive sync URL from async URL if not explicitly set
+        if not self.database_sync_url:
+            self.database_sync_url = self.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
         for attr in ("database_url", "database_sync_url"):
             url = getattr(self, attr)

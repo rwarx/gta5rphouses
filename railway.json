@@ -1,8 +1,5 @@
 {
   "build": {
     "dockerfilePath": "docker/Dockerfile"
-  },
-  "deploy": {
-    "startCommand": "railway"
   }
 }

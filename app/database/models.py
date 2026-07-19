@@ -135,3 +135,116 @@ class ScraperLog(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ran_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     is_payday_run: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class RealEstateObject(Base):
+    """
+    Current known state of a single occupied object from the `/realestate` catalog.
+
+    The catalog only lists *occupied* objects, so a row here means "occupied as of
+    last_seen_at". When an object stops appearing in the catalog it has been freed;
+    that transition is recorded as a RealEstateEvent and `is_occupied` flips to False.
+    """
+    __tablename__ = "realestate_objects"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Stable key: "<server_sid>:<kind>:<unit_id>", e.g. "20:house:1".
+    object_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # "house" | "apartment"
+    unit_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    class_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    vehicle_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    building_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    is_occupied: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    __table_args__ = (
+        Index("idx_realestate_server_occupied", "server_sid", "is_occupied"),
+    )
+
+
+class RealEstateEvent(Base):
+    """
+    A detected transition for a realestate object (freed / occupied / owner_changed).
+
+    These are the notifiable events: a `freed` event is the moment a house or
+    apartment became available for purchase.
+    """
+    __tablename__ = "realestate_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    object_key: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # "house" | "apartment"
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)  # freed | occupied | owner_changed
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    price: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    class_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    building_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    old_owner: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    new_owner: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    notified: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        Index("idx_realestate_event_notified", "notified", "detected_at"),
+    )
+
+
+class RealEstateOwnerHistory(Base):
+    """
+    Append-only log of the owner nickname seen on a realestate object over time.
+
+    Every time the catalog reports a *different* owner for an object we add a row
+    here. This lets us reconstruct who held a house/apartment and when, and — the
+    reason it exists — spot a nickname change that happens during Payday, which
+    often means the object silently freed and was re-bought (or is about to free)
+    before the catalog/map catches up. See RealEstateDetector.
+    """
+    __tablename__ = "realestate_owner_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Same stable key as RealEstateObject: "<server_sid>:<kind>:<unit_id>".
+    object_key: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # "house" | "apartment"
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Owner recorded on the row just before this one (None for the first sighting).
+    previous_owner: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # True if this change was observed inside the Payday window.
+    during_payday: Mapped[bool] = mapped_column(Boolean, default=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    __table_args__ = (
+        Index("idx_owner_history_key_time", "object_key", "recorded_at"),
+    )
+
+
+class RealEstateBuildingState(Base):
+    """
+    Current known state of an apartment building aggregate from the catalog.
+
+    Buildings (Eclipse Towers, Seoul Towers, ...) come from the catalog's
+    `apartmentHouses` list with a live free/total count. Individual apartments
+    are stored as RealEstateObject rows keyed by building via `building_name`;
+    this table keeps the per-building rollup for quick catalog listings.
+    """
+    __tablename__ = "realestate_buildings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Stable key: "<server_sid>:building:<building_id>".
+    building_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    building_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    apartments_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    free_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    image: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    __table_args__ = (
+        Index("idx_building_server", "server_sid"),
+    )

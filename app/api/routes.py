@@ -16,6 +16,7 @@ from app.database.repository import (
     ChangeRepository,
     ScraperLogRepository,
     NotificationRepository,
+    RealEstateRepository,
 )
 from app.database.models import Apartment
 
@@ -286,4 +287,70 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "service": "GTA5RP Apartment Checker",
+    }
+
+
+# ============ RealEstate (catalog source) endpoints ============
+
+@router.get("/realestate/events")
+async def get_realestate_events(
+    limit: int = Query(50, description="Number of events to return"),
+    event_type: Optional[str] = Query(None, description="Filter: freed | occupied | owner_changed"),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Get recent events detected from the /realestate catalog."""
+    repo = RealEstateRepository(session)
+    events = await repo.get_recent_events(limit=limit, event_type=event_type)
+
+    return [
+        {
+            "id": e.id,
+            "object_key": e.object_key,
+            "server_sid": e.server_sid,
+            "kind": e.kind,
+            "event_type": e.event_type,
+            "name": e.name,
+            "price": e.price,
+            "class_name": e.class_name,
+            "building_name": e.building_name,
+            "old_owner": e.old_owner,
+            "new_owner": e.new_owner,
+            "detected_at": e.detected_at.isoformat() if e.detected_at else None,
+            "notified": e.notified,
+        }
+        for e in events
+    ]
+
+
+@router.get("/realestate/status")
+async def get_realestate_status(
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Get realestate source configuration and current occupied count."""
+    from app.config import get_settings
+    from app.scraper.realestate_client import server_name_to_sid
+
+    rs = get_settings().realestate
+    sid = server_name_to_sid(rs.server_name)
+    repo = RealEstateRepository(session)
+    occupied = await repo.count_occupied(sid) if sid else 0
+    recent = await repo.get_recent_events(limit=10)
+
+    return {
+        "enabled": rs.enabled,
+        "server_name": rs.server_name,
+        "server_sid": sid,
+        "interval": rs.interval,
+        "notify_freed": rs.notify_freed,
+        "occupied_objects": occupied,
+        "recent_events": [
+            {
+                "kind": e.kind,
+                "event_type": e.event_type,
+                "name": e.name,
+                "price": e.price,
+                "detected_at": e.detected_at.isoformat() if e.detected_at else None,
+            }
+            for e in recent
+        ],
     }

@@ -9,6 +9,7 @@ from app.config.settings import (
     LoggingSettings,
     APISettings,
     CrashDetectionSettings,
+    RealEstateSettings,
     get_settings,
     setup_logging,
 )

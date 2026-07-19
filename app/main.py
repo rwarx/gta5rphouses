@@ -13,36 +13,41 @@ from app.database import init_db, close_db
 
 
 async def run_all_services() -> None:
-    """Run scraper, bot and notifier concurrently."""
+    """Run scraper, realestate source, bot and notifier concurrently."""
     from app.scraper.scheduler import SmartScheduler
+    from app.scraper.realestate_scheduler import RealEstateScheduler
     from app.telegram.bot import ApartmentBot
     from app.telegram.notifier import ChangeNotifier
-    
+
     settings = get_settings()
-    
+
     # Initialize database
     await init_db()
-    
+
     # Create scheduler
     scheduler = SmartScheduler()
-    
+
     # Start scheduler
     scheduler_task = asyncio.create_task(scheduler.start())
-    
+
+    # Start the realestate HTTP source (no-op if REALESTATE_ENABLED=false)
+    realestate_scheduler = RealEstateScheduler()
+    realestate_task = asyncio.create_task(realestate_scheduler.start())
+
     # Start Telegram bot
     bot = ApartmentBot(scheduler)
     bot_task = asyncio.create_task(bot.start())
-    
+
     # Start notification notifier (waits for bot to be ready)
     notifier_task = asyncio.create_task(_run_notifier(bot))
-    
+
     logger.info(f"All services started")
-    
+
     # Wait for all tasks (each handles own exceptions)
-    tasks = [scheduler_task, bot_task]
+    tasks = [scheduler_task, realestate_task, bot_task]
     if notifier_task:
         tasks.append(notifier_task)
-    
+
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for i, r in enumerate(results):
@@ -52,6 +57,7 @@ async def run_all_services() -> None:
         logger.info("Shutting down...")
     finally:
         await scheduler.stop()
+        await realestate_scheduler.stop()
         await bot.stop()
         if notifier_task and not notifier_task.done():
             notifier_task.cancel()
@@ -91,14 +97,33 @@ async def run_scraper_only() -> None:
 async def run_bot_only() -> None:
     """Run only the Telegram bot."""
     from app.telegram.bot import ApartmentBot
-    
+
     await init_db()
     bot = ApartmentBot()
-    
+
     try:
         await bot.start()
     except KeyboardInterrupt:
         logger.info("Shutting down bot...")
     finally:
         await bot.stop()
+        await close_db()
+
+
+async def run_realestate_only() -> None:
+    """Run only the /realestate catalog source (no map scraper, no bot)."""
+    from app.scraper.realestate_scheduler import RealEstateScheduler
+
+    await init_db()
+    scheduler = RealEstateScheduler()
+
+    try:
+        await scheduler.start()
+        # start() returns once the polling task is spawned; keep the process alive.
+        while scheduler.is_running:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down realestate source...")
+    finally:
+        await scheduler.stop()
         await close_db()

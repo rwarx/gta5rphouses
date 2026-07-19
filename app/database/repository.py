@@ -22,6 +22,10 @@ from app.database.models import (
     ScraperSettings,
     Notification,
     ScraperLog,
+    RealEstateObject,
+    RealEstateEvent,
+    RealEstateOwnerHistory,
+    RealEstateBuildingState,
 )
 
 
@@ -47,7 +51,7 @@ class ApartmentRepository:
 
     async def get_all(self, active_only: bool = True) -> List[Apartment]:
         """Get all apartments, optionally only active ones."""
-        query = select(Apartment)
+        query = select(Apartment).options(selectinload(Apartment.apartment_types))
         if active_only:
             query = query.where(Apartment.is_active == True)
         query = query.order_by(Apartment.name)
@@ -108,7 +112,9 @@ class ApartmentRepository:
 
     async def search(self, query: str) -> List[Apartment]:
         """Search apartments by name or address."""
-        stmt = select(Apartment).where(
+        stmt = select(Apartment).options(
+            selectinload(Apartment.apartment_types)
+        ).where(
             or_(
                 Apartment.name.ilike(f"%{query}%"),
                 Apartment.address.ilike(f"%{query}%"),
@@ -121,6 +127,7 @@ class ApartmentRepository:
         """Get apartments with free units available."""
         result = await self.session.execute(
             select(Apartment)
+            .options(selectinload(Apartment.apartment_types))
             .where(
                 and_(
                     Apartment.is_active == True,
@@ -489,3 +496,224 @@ class ScraperLogRepository:
                 ).scalars().all()
             ) if total_runs > 0 else 0,
         }
+
+
+class RealEstateRepository:
+    """
+    Repository for the `/realestate` catalog: current object state + events.
+
+    Objects are keyed by a stable "<server_sid>:<kind>:<unit_id>" string so the
+    same house/apartment is tracked across snapshots regardless of DB id.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @staticmethod
+    def make_key(server_sid: str, kind: str, unit_id: int) -> str:
+        """Build the stable object key, e.g. '20:house:1'."""
+        return f"{server_sid}:{kind}:{unit_id}"
+
+    @staticmethod
+    def make_building_key(server_sid: str, building_id: int) -> str:
+        """Build the stable building key, e.g. '20:building:10'."""
+        return f"{server_sid}:building:{building_id}"
+
+    async def get_occupied_keys(self, server_sid: str) -> Dict[str, RealEstateObject]:
+        """Return all currently-occupied objects for a server, keyed by object_key."""
+        result = await self.session.execute(
+            select(RealEstateObject).where(
+                and_(
+                    RealEstateObject.server_sid == server_sid,
+                    RealEstateObject.is_occupied == True,
+                )
+            )
+        )
+        return {obj.object_key: obj for obj in result.scalars().all()}
+
+    async def upsert_occupied(self, object_key: str, data: Dict[str, Any]) -> RealEstateObject:
+        """Insert a newly-seen object or refresh an existing one (marking it occupied)."""
+        result = await self.session.execute(
+            select(RealEstateObject).where(RealEstateObject.object_key == object_key)
+        )
+        obj = result.scalar_one_or_none()
+
+        if obj:
+            for key, value in data.items():
+                if key not in ("object_key", "first_seen_at"):
+                    setattr(obj, key, value)
+            obj.is_occupied = True
+        else:
+            obj = RealEstateObject(object_key=object_key, is_occupied=True, **data)
+            self.session.add(obj)
+
+        await self.session.flush()
+        return obj
+
+    async def mark_freed(self, object_key: str) -> None:
+        """Flag an object as no longer occupied (it disappeared from the catalog)."""
+        await self.session.execute(
+            update(RealEstateObject)
+            .where(RealEstateObject.object_key == object_key)
+            .values(is_occupied=False)
+        )
+        await self.session.flush()
+
+    async def create_event(self, data: Dict[str, Any]) -> RealEstateEvent:
+        """Record a detected transition (freed / occupied / owner_changed)."""
+        event = RealEstateEvent(**data)
+        self.session.add(event)
+        await self.session.flush()
+        return event
+
+    async def get_unnotified_events(self) -> List[RealEstateEvent]:
+        """Get events pending Telegram delivery, oldest first."""
+        result = await self.session.execute(
+            select(RealEstateEvent)
+            .where(RealEstateEvent.notified == False)
+            .order_by(RealEstateEvent.detected_at.asc())
+        )
+        return list(result.scalars().all())
+
+    async def mark_event_notified(self, event_id: int) -> None:
+        """Mark an event as delivered."""
+        await self.session.execute(
+            update(RealEstateEvent)
+            .where(RealEstateEvent.id == event_id)
+            .values(notified=True, notified_at=datetime.utcnow())
+        )
+        await self.session.flush()
+
+    async def get_recent_events(
+        self, limit: int = 20, event_type: Optional[str] = None
+    ) -> List[RealEstateEvent]:
+        """Get recent events, optionally filtered by type."""
+        query = select(RealEstateEvent)
+        if event_type:
+            query = query.where(RealEstateEvent.event_type == event_type)
+        query = query.order_by(RealEstateEvent.detected_at.desc()).limit(limit)
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+
+    async def count_occupied(self, server_sid: str, kind: Optional[str] = None) -> int:
+        """Count currently-occupied objects for a server, optionally by kind."""
+        conditions = [
+            RealEstateObject.server_sid == server_sid,
+            RealEstateObject.is_occupied == True,
+        ]
+        if kind:
+            conditions.append(RealEstateObject.kind == kind)
+        result = await self.session.execute(
+            select(func.count(RealEstateObject.id)).where(and_(*conditions))
+        )
+        return result.scalar() or 0
+
+    # ---- Owner nickname history ----
+
+    async def add_owner_history(
+        self,
+        object_key: str,
+        server_sid: str,
+        kind: str,
+        owner_name: Optional[str],
+        previous_owner: Optional[str],
+        during_payday: bool,
+    ) -> RealEstateOwnerHistory:
+        """Append a row recording the owner seen on an object at this moment."""
+        row = RealEstateOwnerHistory(
+            object_key=object_key,
+            server_sid=server_sid,
+            kind=kind,
+            owner_name=owner_name,
+            previous_owner=previous_owner,
+            during_payday=during_payday,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_owner_history(
+        self, object_key: str, limit: int = 20
+    ) -> List[RealEstateOwnerHistory]:
+        """Return the owner history for an object, newest first."""
+        result = await self.session.execute(
+            select(RealEstateOwnerHistory)
+            .where(RealEstateOwnerHistory.object_key == object_key)
+            .order_by(RealEstateOwnerHistory.recorded_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    # ---- Building aggregates ----
+
+    async def upsert_building(self, building_key: str, data: Dict[str, Any]) -> RealEstateBuildingState:
+        """Insert or refresh an apartment-building aggregate row."""
+        result = await self.session.execute(
+            select(RealEstateBuildingState).where(
+                RealEstateBuildingState.building_key == building_key
+            )
+        )
+        obj = result.scalar_one_or_none()
+        if obj:
+            for key, value in data.items():
+                if key != "building_key":
+                    setattr(obj, key, value)
+        else:
+            obj = RealEstateBuildingState(building_key=building_key, **data)
+            self.session.add(obj)
+        await self.session.flush()
+        return obj
+
+    async def get_buildings(self, server_sid: str) -> List[RealEstateBuildingState]:
+        """Return all known buildings for a server, ordered by name."""
+        result = await self.session.execute(
+            select(RealEstateBuildingState)
+            .where(RealEstateBuildingState.server_sid == server_sid)
+            .order_by(RealEstateBuildingState.name)
+        )
+        return list(result.scalars().all())
+
+    # ---- Catalog listing (occupied objects) ----
+
+    async def list_occupied(
+        self,
+        server_sid: str,
+        kind: Optional[str] = None,
+        building_name: Optional[str] = None,
+        class_name: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[RealEstateObject]:
+        """List currently-occupied objects with optional filters, for the catalog."""
+        conditions = [
+            RealEstateObject.server_sid == server_sid,
+            RealEstateObject.is_occupied == True,
+        ]
+        if kind:
+            conditions.append(RealEstateObject.kind == kind)
+        if building_name:
+            conditions.append(RealEstateObject.building_name == building_name)
+        if class_name:
+            conditions.append(RealEstateObject.class_name == class_name)
+        if search:
+            like = f"%{search}%"
+            conditions.append(
+                or_(
+                    RealEstateObject.name.ilike(like),
+                    RealEstateObject.owner_name.ilike(like),
+                )
+            )
+        result = await self.session.execute(
+            select(RealEstateObject)
+            .where(and_(*conditions))
+            .order_by(RealEstateObject.name)
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def get_object(self, object_key: str) -> Optional[RealEstateObject]:
+        """Fetch a single object by its stable key (occupied or freed)."""
+        result = await self.session.execute(
+            select(RealEstateObject).where(RealEstateObject.object_key == object_key)
+        )
+        return result.scalar_one_or_none()

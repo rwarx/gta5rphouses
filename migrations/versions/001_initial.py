@@ -120,6 +120,18 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id'),
     )
 
+    # Crash day logs table
+    op.create_table(
+        'crash_day_logs',
+        sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column('crash_date', sa.String(10), nullable=False),
+        sa.Column('apartments_data', sa.Text(), nullable=False),
+        sa.Column('total_freed', sa.Integer(), nullable=False, server_default='0'),
+        sa.Column('detected_at', sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint('id'),
+    )
+    op.create_index('idx_crash_date', 'crash_day_logs', ['crash_date'])
+
     # Scraper logs table
     op.create_table(
         'scraper_logs',
@@ -144,5 +156,6 @@ def downgrade() -> None:
     op.drop_table('changes')
     op.drop_table('apartment_history')
     op.drop_table('apartment_types')
+    op.drop_table('crash_day_logs')
     op.drop_table('scraper_logs')
     op.drop_table('apartments')

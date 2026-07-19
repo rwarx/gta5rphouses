@@ -5,6 +5,7 @@
 ## 📋 Функциональность
 
 - **Автоматический сбор данных** — Playwright скрапинг всех ~35 квартир с карты
+- **RealEstate-источник** — быстрый HTTP-мониторинг каталога `/realestate` одного сервера: ловит освобождение домов/квартир по их исчезновению из каталога (см. `REALESTATE_*` в `.env.example`)
 - **Smart Mode** — адаптивный мониторинг с учетом Payday (HH:59)
 - **История изменений** — хранение снэпшотов и отслеживание изменений
 - **Telegram Bot** — уведомления об изменениях и управление
@@ -84,6 +85,7 @@ docker-compose up -d
 - `/stats` — статистика
 - `/last_update` — последнее обновление
 - `/scrape` — ручной запуск парсера
+- `/realestate` — состояние каталога `/realestate` и последние освобождения
 
 ### Web UI
 
@@ -110,6 +112,12 @@ LOW_INTERVAL=600          # 10 минут между проверками
 HIGH_INTERVAL=5           # 5 секунд в Payday окно
 PAYDAY_START_MINUTE=56    # Начало Payday (минута часа)
 PAYDAY_END_MINUTE=1       # Конец Payday (минута следующего часа)
+
+# Источник /realestate (каталог сервера)
+REALESTATE_ENABLED=false        # Включить опрос каталога /realestate
+REALESTATE_SERVER=Murrieta      # Имя сервера
+REALESTATE_INTERVAL=300         # Интервал опроса, сек (>= 5)
+REALESTATE_NOTIFY_FREED=true    # Уведомлять об освобождениях
 ```
 
 ## 🐳 Docker
@@ -138,10 +146,10 @@ docker-compose up -d --scale app=2
 ## 🧪 Тестирование
 
 ```bash
-# Установка зависимостей
-pip install -r docker/requirements.txt
+# Установка зависимостей (runtime + dev)
+pip install -r requirements.txt -r requirements-dev.txt
 
-# Запуск тестов
+# Запуск тестов (используют in-memory SQLite, внешние сервисы не нужны)
 pytest tests/
 ```
 

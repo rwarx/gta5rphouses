@@ -1,0 +1,56 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.local
+.env.production
+
+# Local database & data
+*.db
+*.sqlite
+*.sqlite3
+data/
+exports/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Frontend build artifacts (image builds these itself if needed)
+node_modules/
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+
+# Playwright profiles
+user-data/
+browser-data/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Misc local files
+start.bat
+*.docx
+kwartira.png

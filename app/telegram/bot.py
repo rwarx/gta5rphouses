@@ -80,6 +80,13 @@ class ApartmentBot:
         self.dp.message.register(self.cmd_map_check, Command("map_check"))
         self.dp.message.register(self.cmd_free_notify, Command("free_notify"))
         self.dp.message.register(self.cmd_crashday, Command("crashday"))
+        self.dp.message.register(self.cmd_realestate, Command("realestate"))
+        self.dp.message.register(self.cmd_buildings, Command("buildings"))
+        self.dp.message.register(self.cmd_building, Command("building"))
+        self.dp.message.register(self.cmd_houses, Command("houses"))
+        self.dp.message.register(self.cmd_owners, Command("owners"))
+        self.dp.message.register(self.cmd_owner_history, Command("owner_history"))
+        self.dp.message.register(self.cmd_possibly_notify, Command("possibly_notify"))
 
         # Register callback queries
         self.dp.callback_query.register(self._on_callback)
@@ -185,6 +192,271 @@ class ApartmentBot:
         )
         await message.answer(text, parse_mode="HTML")
 
+    async def cmd_realestate(self, message: Message) -> None:
+        """Show the /realestate source status and recent freed objects."""
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import server_name_to_sid
+
+        rs = self.settings.realestate
+        sid = server_name_to_sid(rs.server_name)
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            occupied = await repo.count_occupied(sid) if sid else 0
+            recent = await repo.get_recent_events(limit=10, event_type="freed")
+
+        status = "🟢 Включён" if rs.enabled else "🔴 Выключен"
+        lines = [
+            "<b>🏢 Каталог /realestate</b>",
+            f"┣ Источник: {status}",
+            f"┣ Сервер: {rs.server_name} (sid {sid or '—'})",
+            f"┣ Интервал: {rs.interval}s",
+            f"┗ Занятых объектов: {occupied}",
+        ]
+
+        if recent:
+            lines.append("\n<b>🎉 Последние освобождения:</b>")
+            for e in recent:
+                when = e.detected_at.strftime("%d.%m %H:%M") if e.detected_at else "—"
+                kind_ru = "дом" if e.kind == "house" else "кв."
+                price = f" · {e.price:,}".replace(",", " ") if e.price else ""
+                lines.append(f"• {when} — {kind_ru} {e.name or e.object_key}{price}")
+        else:
+            lines.append("\n<i>Освобождений пока не зафиксировано.</i>")
+
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+    # ---- Catalog: owner listings (houses / apartments) ----
+
+    @staticmethod
+    def _fmt_price(price: Optional[int]) -> str:
+        """Format a price with space thousands separators, or '—'."""
+        if not price:
+            return "—"
+        return f"{price:,}".replace(",", " ")
+
+    async def _reply_chunked(self, message: Message, lines: List[str], header: str = "") -> None:
+        """Send potentially long line lists as multiple <=4000-char messages."""
+        if not lines:
+            await message.answer(header or "Нет данных.", parse_mode="HTML")
+            return
+        buf = header
+        for line in lines:
+            piece = ("\n" if buf else "") + line
+            if len(buf) + len(piece) > 4000:
+                await message.answer(buf, parse_mode="HTML")
+                buf = line
+            else:
+                buf += piece
+        if buf:
+            await message.answer(buf, parse_mode="HTML")
+
+    def _current_sid(self) -> Optional[str]:
+        from app.scraper.realestate_client import server_name_to_sid
+        return server_name_to_sid(self.settings.realestate.server_name)
+
+    async def cmd_buildings(self, message: Message) -> None:
+        """List apartment buildings with free/total counts."""
+        from app.database.repository import RealEstateRepository
+
+        sid = self._current_sid()
+        if not sid:
+            await message.answer("⚠️ Сервер не распознан.")
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid)
+
+        if not buildings:
+            await message.answer("🏢 Данных о зданиях пока нет. Дождитесь первого сканирования.")
+            return
+
+        lines = []
+        for b in buildings:
+            free = b.free_count if b.free_count is not None else 0
+            total = b.apartments_count if b.apartments_count is not None else "?"
+            icon = "🟢" if free else "🔴"
+            lines.append(f"{icon} {b.name} — свободно {free}/{total}")
+        lines.append("\n<i>Владельцы: /building &lt;название&gt;</i>")
+        await self._reply_chunked(message, lines, "<b>🏢 Жилые здания</b>\n")
+
+    async def cmd_building(self, message: Message) -> None:
+        """List all apartments (with owners) inside a building."""
+        from app.database.repository import RealEstateRepository
+
+        query = message.text.replace("/building", "").strip()
+        if not query:
+            await message.answer(
+                "Укажите название здания. Пример: <code>/building Eclipse Towers</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        sid = self._current_sid()
+        if not sid:
+            await message.answer("⚠️ Сервер не распознан.")
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            # Resolve the building name from the (possibly partial) query.
+            buildings = await repo.get_buildings(sid)
+            match = next(
+                (b for b in buildings if query.lower() in (b.name or "").lower()), None
+            )
+            building_name = match.name if match else query
+            units = await repo.list_occupied(
+                sid, kind="apartment", building_name=building_name
+            )
+
+        if not units:
+            await message.answer(
+                f"🏢 Занятых квартир в «{building_name}» не найдено "
+                f"(проверьте название через /buildings)."
+            )
+            return
+
+        units.sort(key=lambda u: u.unit_id)
+        lines = []
+        for u in units:
+            cls = f" · {u.class_name}" if u.class_name else ""
+            lines.append(
+                f"🔴 {u.name or ('#' + str(u.unit_id))}{cls}\n"
+                f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
+            )
+        header = f"<b>🏢 {building_name}</b>\nЗанятых квартир: {len(units)}\n\n"
+        await self._reply_chunked(message, lines, header)
+
+    async def cmd_houses(self, message: Message) -> None:
+        """List occupied private houses with owners; optional search filter."""
+        from app.database.repository import RealEstateRepository
+
+        query = message.text.replace("/houses", "").strip()
+        sid = self._current_sid()
+        if not sid:
+            await message.answer("⚠️ Сервер не распознан.")
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            houses = await repo.list_occupied(
+                sid, kind="house", search=query or None, limit=300
+            )
+
+        if not houses:
+            await message.answer(
+                "🏠 Домов не найдено." if query else
+                "🏠 Данных о домах пока нет. Дождитесь первого сканирования."
+            )
+            return
+
+        houses.sort(key=lambda u: u.unit_id)
+        lines = []
+        for u in houses:
+            cls = f" · {u.class_name}" if u.class_name else ""
+            lines.append(
+                f"🔴 {u.name or ('Дом #' + str(u.unit_id))}{cls}\n"
+                f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
+            )
+        title = f"поиск «{query}»" if query else "все занятые"
+        header = f"<b>🏠 Дома · {title}</b>\nНайдено: {len(houses)}\n\n"
+        if not query and len(houses) >= 300:
+            header += "<i>Показаны первые 300. Уточните: /houses &lt;текст&gt;</i>\n\n"
+        await self._reply_chunked(message, lines, header)
+
+    async def cmd_owners(self, message: Message) -> None:
+        """Find all objects (houses + apartments) owned by a nickname."""
+        from app.database.repository import RealEstateRepository
+
+        query = message.text.replace("/owners", "").strip()
+        if not query:
+            await message.answer(
+                "Укажите ник. Пример: <code>/owners Kirill_Morales</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        sid = self._current_sid()
+        if not sid:
+            await message.answer("⚠️ Сервер не распознан.")
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            objs = await repo.list_occupied(sid, search=query, limit=200)
+
+        # list_occupied searches name+owner; keep only owner matches here.
+        objs = [o for o in objs if query.lower() in (o.owner_name or "").lower()]
+        if not objs:
+            await message.answer(f"👤 Объектов у «{query}» не найдено.")
+            return
+
+        lines = []
+        for o in objs:
+            kind_ru = "🏠 Дом" if o.kind == "house" else "🏢 Кв."
+            where = f" ({o.building_name})" if o.building_name else ""
+            lines.append(
+                f"{kind_ru} {o.name or o.unit_id}{where} · 💰 {self._fmt_price(o.price)} · 👤 {o.owner_name}"
+            )
+        await self._reply_chunked(message, lines, f"<b>👤 Объекты игрока</b>\nНайдено: {len(objs)}\n\n")
+
+    async def cmd_owner_history(self, message: Message) -> None:
+        """Show the owner-nickname timeline for one object by its key."""
+        from app.database.repository import RealEstateRepository
+
+        query = message.text.replace("/owner_history", "").strip()
+        if not query:
+            await message.answer(
+                "Укажите ключ объекта. Пример: <code>/owner_history 20:house:242</code>\n"
+                "<i>Ключ показывается в уведомлениях и каталоге.</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            obj = await repo.get_object(query)
+            history = await repo.get_owner_history(query, limit=30)
+
+        if not obj and not history:
+            await message.answer(f"🔍 Объект «{query}» не найден.")
+            return
+
+        title = (obj.name if obj else query) or query
+        lines = [f"<b>📜 История владельцев</b>\n🏠 {title}\n"]
+        if not history:
+            lines.append("<i>Смен владельца не зафиксировано.</i>")
+        else:
+            for h in history:
+                when = h.recorded_at.strftime("%d.%m %H:%M") if h.recorded_at else "—"
+                pd = " ⚡️Payday" if h.during_payday else ""
+                lines.append(
+                    f"• {when}: {h.previous_owner or '—'} → {h.owner_name or '—'}{pd}"
+                )
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n")
+
+    async def cmd_possibly_notify(self, message: Message) -> None:
+        """Toggle notifications for 'possibly freed' (Payday owner-change) events."""
+        from app.database.repository import ScraperSettingsRepository
+
+        if not self._is_admin(message.from_user.id):
+            await message.answer("⛔ Только для админов.")
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = ScraperSettingsRepository(session)
+            current = await repo.get("notify_possibly_freed")
+            if current is None:
+                current = "1"
+            new_val = "0" if current == "1" else "1"
+            await repo.set("notify_possibly_freed", new_val)
+
+        status = "🔔 включены" if new_val == "1" else "🔕 выключены"
+        await message.answer(
+            f"Уведомления о «возможных слётах» (смена ника в пейдей) {status}."
+        )
+
     async def cmd_start(self, message: Message) -> None:
         uid = message.from_user.id
         text = (
@@ -196,6 +468,11 @@ class ApartmentBot:
             "  /search <i>текст</i> — поиск\n"
             "  /status <i>id</i> — статус\n"
             "  /stats — статистика\n"
+            "  /realestate — каталог: освобождения\n"
+            "  /buildings — жилые здания (кол-во свободных)\n"
+            "  /building <i>название</i> — квартиры здания\n"
+            "  /houses — дома с владельцами\n"
+            "  /owners <i>ник</i> — поиск по владельцу\n"
             "  /crashday — слёты за сегодня\n"
             "  /last_update — последний запуск\n\n"
             "<i>Также используйте кнопки ниже</i> 👇"
@@ -213,7 +490,15 @@ class ApartmentBot:
             "  /history <i>id</i> — история изменений\n"
             "  /last_update — время обновления\n"
             "  /stats — статистика системы\n"
-            "  /crashday — слёты за сегодня"
+            "  /crashday — слёты за сегодня\n"
+            "  /realestate — каталог /realestate (освобождения)\n\n"
+            "<b>🏢 Каталог владельцев:</b>\n"
+            "  /buildings — список зданий (квартиры)\n"
+            "  /building <i>название</i> — владельцы квартир в здании\n"
+            "  /houses — список занятых домов\n"
+            "  /owners <i>ник</i> — поиск объектов по владельцу\n"
+            "  /owner_history <i>ключ</i> — история ников объекта\n"
+            "  /possibly_notify — вкл/выкл «возможные слёты»"
         )
         await message.answer(text, parse_mode="HTML")
 

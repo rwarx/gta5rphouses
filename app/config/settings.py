@@ -11,10 +11,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env file from project root (explicit path for robustness)
+# Load .env file from project root (explicit path for robustness).
+# override=False so real environment variables (set by the OS, the deploy
+# platform, or the test harness) always win over the .env file.
 _env_path = Path(__file__).resolve().parent.parent.parent / ".env"
 if _env_path.exists():
-    load_dotenv(dotenv_path=str(_env_path), override=True)
+    load_dotenv(dotenv_path=str(_env_path), override=False)
 else:
     load_dotenv()  # fallback to default search
 
@@ -116,6 +118,31 @@ class CrashDetectionSettings:
     check_interval: int = int(env("CRASH_CHECK_INTERVAL", "60"))
 
 
+class RealEstateSettings:
+    """
+    Settings for the `/realestate` catalog source.
+
+    Unlike the map scraper (which drives a browser), this source fetches the
+    full real-estate catalog for a single server over HTTP. It runs on its own
+    interval alongside the map scraper.
+    """
+    # Enable the realestate HTTP source (independent of the map scraper).
+    enabled: bool = env("REALESTATE_ENABLED", "false").lower() == "true"
+    # Human-readable server name; mapped to its sid via SERVER_ORDER.
+    server_name: str = env("REALESTATE_SERVER", "Murrieta")
+    # Seconds between catalog fetches.
+    interval: int = int(env("REALESTATE_INTERVAL", "300"))
+    # Notify on newly freed objects (an occupied unit disappearing from the catalog).
+    notify_freed: bool = env("REALESTATE_NOTIFY_FREED", "true").lower() == "true"
+    # Notify on "possibly freed" objects: an owner nickname change during the
+    # Payday window. The map/catalog does not always refresh instantly, so a nick
+    # swap in Payday is treated as a signal the object may have just been freed.
+    notify_possibly_freed: bool = env("REALESTATE_NOTIFY_POSSIBLY_FREED", "true").lower() == "true"
+
+    def __init__(self):
+        assert self.interval >= 5, "REALESTATE_INTERVAL must be >= 5"
+
+
 class Settings:
     """
     Main application settings.
@@ -129,6 +156,7 @@ class Settings:
         
         self.database = DatabaseSettings()
         self.scraper = ScraperSettings()
+        self.realestate = RealEstateSettings()
         self.smart_mode = SmartModeSettings()
         self.telegram = TelegramSettings()
         self.logging = LoggingSettings()

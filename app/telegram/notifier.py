@@ -31,6 +31,9 @@ class ChangeNotifier:
         self.bot = bot
         self.settings = get_settings()
         self._running = False
+        # UTC hour (YYYY-MM-DD-HH) for which the hourly report was last sent, so
+        # we emit exactly one report per clock hour.
+        self._last_report_hour: Optional[str] = None
 
     async def start(self) -> None:
         """Start the notification monitoring loop."""
@@ -44,10 +47,82 @@ class ChangeNotifier:
         while self._running:
             try:
                 await self._process_pending_notifications()
+                await self._maybe_send_hourly_report()
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Notification loop error: {e}")
                 await asyncio.sleep(10)
+
+    async def _maybe_send_hourly_report(self) -> None:
+        """Once per clock hour, send a single compact Payday summary.
+
+        Instead of spamming one message per catalog change during Payday, we
+        roll the last hour of events into one report: how many houses/apartments
+        freed, and how many owner-nickname changes (possible silent free-ups)
+        were seen.
+        """
+        now = datetime.now(timezone.utc)
+        hour_key = now.strftime("%Y-%m-%d-%H")
+        if self._last_report_hour == hour_key:
+            return
+
+        # On the very first loop iteration just latch the current hour; don't
+        # fire a report immediately on startup.
+        if self._last_report_hour is None:
+            self._last_report_hour = hour_key
+            return
+
+        async with DatabaseSession.get_session_context() as session:
+            settings_repo = ScraperSettingsRepository(session)
+            enabled = await settings_repo.get("hourly_report")
+            if enabled is None:
+                await settings_repo.set("hourly_report", "1")
+                enabled = "1"
+            if enabled != "1":
+                self._last_report_hour = hour_key
+                return
+
+            realestate_repo = RealEstateRepository(session)
+            since = now - timedelta(hours=1)
+            events = await realestate_repo.get_events_since(since)
+
+        self._last_report_hour = hour_key
+        message = self._build_hourly_report(events, since, now)
+        for user_id in self.settings.telegram.allowed_users:
+            await send_notification(self.bot, user_id, message)
+
+    def _build_hourly_report(self, events, since, now) -> str:
+        """Render the last hour of catalog events as one compact report."""
+        freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
+        freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
+        possibly = [e for e in events if e.event_type == "possibly_freed"]
+
+        period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
+        lines = [
+            "🕐 <b>Почасовой отчёт (пейдей)</b>",
+            f"<i>{period}</i>",
+            "━━━━━━━━━━━━━━━",
+            f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
+            f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>",
+            f"🔄 Смен ников (возможные слёты): <b>{len(possibly)}</b>",
+        ]
+
+        if not events:
+            lines.append("\n<i>За этот час изменений не было.</i>")
+            return "\n".join(lines)
+
+        # A short sample of the possibly-freed objects, so the report is
+        # actionable without flooding the chat.
+        if possibly:
+            lines.append("\n<b>Возможные слёты:</b>")
+            for e in possibly[:10]:
+                kind_ru = "дом" if e.kind == "house" else "кв."
+                name = e.name or e.object_key
+                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
+            if len(possibly) > 10:
+                lines.append(f"…и ещё {len(possibly) - 10}")
+
+        return "\n".join(lines)
 
     async def stop(self) -> None:
         """Stop the notification monitor."""
@@ -65,18 +140,19 @@ class ChangeNotifier:
                 await settings_repo.set("notify_free_found", "1")
                 notify_free = "1"
 
-            # Separate toggle for the "possibly freed" (Payday owner-change) signal.
-            notify_possibly = await settings_repo.get("notify_possibly_freed")
-            if notify_possibly is None:
-                await settings_repo.set("notify_possibly_freed", "1")
-                notify_possibly = "1"
-
             changes = await change_repo.get_unnotified()
 
             for change in changes:
                 try:
-                    # Skip apartment_freed if toggle is off
-                    if change.field_name == "apartment_freed" and notify_free != "1":
+                    # Only a real free-up ("apartment_freed") is worth an instant
+                    # ping. Every other map-scraper field change (type counts,
+                    # timestamps, occupied/free deltas) is noise that spams every
+                    # Payday — swallow it silently; the hourly report covers trends.
+                    if change.field_name != "apartment_freed":
+                        await change_repo.mark_notified(change.id)
+                        continue
+
+                    if notify_free != "1":
                         await change_repo.mark_notified(change.id)
                         continue
 
@@ -97,25 +173,32 @@ class ChangeNotifier:
                     logger.error(f"Failed to process change {change.id}: {e}")
                     continue
 
-            # Deliver realestate catalog events (freed / occupied / owner_changed / possibly_freed).
-            await self._process_realestate_events(session, notify_free, notify_possibly)
+            # Deliver realestate catalog events: instant "freed" only; the rest
+            # (possibly_freed / occupied / owner_changed) is folded into the
+            # hourly Payday report instead of being sent one-by-one.
+            await self._process_realestate_events(session, notify_free)
 
-    async def _process_realestate_events(
-        self, session, notify_free: str, notify_possibly: str
-    ) -> None:
-        """Send pending events detected from the /realestate catalog."""
+    async def _process_realestate_events(self, session, notify_free: str) -> None:
+        """
+        Deliver pending /realestate catalog events.
+
+        Only a real "freed" (object vanished from the catalog -> available to buy)
+        is sent instantly, since that's the time-critical "успей первым" signal.
+        Everything else (possibly_freed / occupied / owner_changed) is marked
+        notified without a per-event message — it is summarised in the hourly
+        Payday report instead, so Payday churn no longer spams the chat.
+        """
         realestate_repo = RealEstateRepository(session)
         events = await realestate_repo.get_unnotified_events()
 
         for event in events:
             try:
-                # "freed" respects the same free-notification toggle as the map source.
-                if event.event_type == "freed" and notify_free != "1":
+                if event.event_type != "freed":
+                    # Folded into the hourly report; no instant message.
                     await realestate_repo.mark_event_notified(event.id)
                     continue
 
-                # "possibly_freed" (Payday owner change) has its own toggle.
-                if event.event_type == "possibly_freed" and notify_possibly != "1":
+                if notify_free != "1":
                     await realestate_repo.mark_event_notified(event.id)
                     continue
 

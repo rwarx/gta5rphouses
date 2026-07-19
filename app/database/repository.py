@@ -608,6 +608,24 @@ class RealEstateRepository:
         )
         return result.scalar() or 0
 
+    async def get_events_since(
+        self, since: datetime, event_types: Optional[List[str]] = None
+    ) -> List[RealEstateEvent]:
+        """Return events detected at/after `since`, optionally filtered by type.
+
+        Used by the hourly Payday digest to summarise what happened in the last
+        window instead of sending one message per event.
+        """
+        conditions = [RealEstateEvent.detected_at >= since]
+        if event_types:
+            conditions.append(RealEstateEvent.event_type.in_(event_types))
+        result = await self.session.execute(
+            select(RealEstateEvent)
+            .where(and_(*conditions))
+            .order_by(RealEstateEvent.detected_at.asc())
+        )
+        return list(result.scalars().all())
+
     # ---- Owner nickname history ----
 
     async def add_owner_history(

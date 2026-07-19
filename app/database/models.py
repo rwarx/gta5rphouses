@@ -248,3 +248,28 @@ class RealEstateBuildingState(Base):
     __table_args__ = (
         Index("idx_building_server", "server_sid"),
     )
+
+
+class RealEstateSubscription(Base):
+    """
+    A Telegram user's subscription to freed-object notifications for a server.
+
+    A row means "user_id wants to be notified about objects freeing up on the
+    server with this sid". `kind` narrows the subscription to houses or
+    apartments only; NULL/"any" means both. Notifications for a server are
+    routed to its subscribers; if a server has no subscribers we fall back to
+    the globally allowed users so nothing goes unheard.
+    """
+    __tablename__ = "realestate_subscriptions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False, index=True)
+    # "any" | "house" | "apartment" — which kinds this user wants for the server.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="any")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (
+        UniqueConstraint("user_id", "server_sid", name="uq_subscription_user_server"),
+        Index("idx_subscription_server", "server_sid"),
+    )

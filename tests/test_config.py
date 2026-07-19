@@ -5,6 +5,7 @@ import importlib
 from app.config import settings as settings_module
 from app.config.settings import (
     DatabaseSettings,
+    RealEstateSettings,
     SmartModeSettings,
     TelegramSettings,
     get_settings,
@@ -36,6 +37,21 @@ def test_database_url_normalizes_railway_scheme(monkeypatch):
     # Sync URL is derived without the asyncpg driver.
     assert db.database_sync_url.startswith("postgresql://")
     assert "+asyncpg" not in db.database_sync_url
+
+
+def test_realestate_server_names_falls_back_to_primary():
+    rs = RealEstateSettings()
+    rs.server_name = "Murrieta"
+    rs._servers_raw = ""
+    assert rs.server_names == ["Murrieta"]
+
+
+def test_realestate_server_names_includes_primary_first_and_dedupes():
+    rs = RealEstateSettings()
+    rs.server_name = "Murrieta"
+    rs._servers_raw = "Strawberry, murrieta ,Sunrise"
+    # Primary always first; case-insensitive duplicate of primary dropped.
+    assert rs.server_names == ["Murrieta", "Strawberry", "Sunrise"]
 
 
 def test_smart_mode_validation_rejects_bad_interval(monkeypatch):

@@ -23,6 +23,7 @@ from app.scraper.anti_detect import AntiDetectManager, create_browser_context
 from app.scraper.playwright_scraper import ApartmentScraper, ApartmentData
 from app.scraper.change_detector import ChangeDetector
 from app.scraper.crash_detector import get_crash_detector, CrashEvent
+from app.scraper.realestate_client import RealEstateClient, server_name_to_sid
 
 
 class MonitorMode(Enum):
@@ -50,10 +51,20 @@ class SmartScheduler:
         self._last_tick_time: Optional[datetime] = None
         self._cached_icons_data: List[Dict[str, Any]] = []
         self._icons_cached = False
+        # Map-update gate: launch the browser scrape only when the /realestate
+        # catalog reports new data (its `fetchedAtMs` marker advanced). The
+        # catalog HTTP fetch is cheap (~80 KB) compared to driving a browser
+        # over ~35 markers, and the marker is the same "Обновлено" value the map
+        # shows, so it tells us exactly when a scrape would find anything new.
+        self._map_gate_client: Optional[RealEstateClient] = None
+        self._map_gate_sid: Optional[str] = None
+        self._last_scraped_fetched_at_ms: Optional[int] = None
 
     async def start(self) -> None:
         """Start the scheduler with Payday-aware monitoring."""
         logger.info("Starting Smart Scheduler...")
+
+        self._init_map_gate()
 
         # Initial full scrape to populate database
         logger.info("Running initial full scrape...")
@@ -106,6 +117,53 @@ class SmartScheduler:
         while self._running:
             await self._smart_tick()
 
+    def _init_map_gate(self) -> None:
+        """Prepare the map-update gate (resolve the catalog server sid once)."""
+        if not self.settings.scraper.map_update_gate:
+            return
+        sid = server_name_to_sid(self.settings.realestate.server_name)
+        if not sid:
+            logger.warning(
+                f"MAP_UPDATE_GATE enabled but REALESTATE_SERVER "
+                f"'{self.settings.realestate.server_name}' is unknown; gate disabled"
+            )
+            return
+        self._map_gate_client = RealEstateClient()
+        self._map_gate_sid = sid
+        logger.info(
+            f"Map-update gate enabled: scraping only when catalog data advances "
+            f"(server sid={sid})"
+        )
+
+    async def _should_scrape(self) -> bool:
+        """
+        Decide whether a browser scrape is worth running this tick.
+
+        When the map-update gate is on, we peek at the catalog's `fetchedAtMs`
+        marker and only scrape if it advanced since our last scrape. The gate
+        fails open: any error reading the marker returns True so a source hiccup
+        never causes a missed update.
+        """
+        if not self._map_gate_client or not self._map_gate_sid:
+            return True
+        try:
+            fetched_ms = await self._map_gate_client.fetch_updated_ms(self._map_gate_sid)
+        except Exception as e:
+            logger.warning(f"Map-update gate check failed ({e}); scraping anyway")
+            return True
+        if fetched_ms is None:
+            logger.warning("Map-update gate got no marker; scraping anyway")
+            return True
+        if fetched_ms == self._last_scraped_fetched_at_ms:
+            logger.debug(f"Map-update gate: catalog unchanged ({fetched_ms}), skipping scrape")
+            return False
+        logger.info(
+            f"Map-update gate: catalog advanced "
+            f"({self._last_scraped_fetched_at_ms} -> {fetched_ms}), scraping"
+        )
+        self._last_scraped_fetched_at_ms = fetched_ms
+        return True
+
     async def _smart_tick(self) -> None:
         now = datetime.now(timezone.utc)
         current_minute = now.minute
@@ -120,7 +178,8 @@ class SmartScheduler:
 
         if time_since_last >= interval:
             self._last_tick_time = now
-            await self._execute_scrape()
+            if await self._should_scrape():
+                await self._execute_scrape()
 
         await asyncio.sleep(1)
 

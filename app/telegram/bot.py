@@ -12,7 +12,24 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
+
+
+class BotStates(StatesGroup):
+    """FSM states for button-driven text input.
+
+    Each button that needs free text (a search query, a nickname, a building
+    name, …) puts the user into one of these states and reads their next
+    message, so the flow works without the user typing a slash command.
+    """
+    search = State()          # apartment name search (/search)
+    status = State()          # apartment id/name status (/status)
+    history = State()         # apartment change history (/history)
+    owners = State()          # owner nickname lookup (/owners)
+    building = State()        # building name lookup (/building)
+    owner_history = State()   # object owner timeline (/owner_history)
 
 from app.config import get_settings
 from app.database.session import DatabaseSession
@@ -88,6 +105,20 @@ class ApartmentBot:
         self.dp.message.register(self.cmd_owner_history, Command("owner_history"))
         self.dp.message.register(self.cmd_possibly_notify, Command("possibly_notify"))
         self.dp.message.register(self.cmd_report, Command("report"))
+        self.dp.message.register(self.cmd_servers, Command("servers"))
+        self.dp.message.register(self.cmd_subscribe, Command("subscribe"))
+        self.dp.message.register(self.cmd_unsubscribe, Command("unsubscribe"))
+        self.dp.message.register(self.cmd_subscriptions, Command("subscriptions"))
+        self.dp.message.register(self.cmd_menu, Command("menu"))
+
+        # FSM: buttons that need free text put the user into a state; these
+        # handlers read the next message and run the corresponding query.
+        self.dp.message.register(self._state_search, BotStates.search)
+        self.dp.message.register(self._state_status, BotStates.status)
+        self.dp.message.register(self._state_history, BotStates.history)
+        self.dp.message.register(self._state_owners, BotStates.owners)
+        self.dp.message.register(self._state_building, BotStates.building)
+        self.dp.message.register(self._state_owner_history, BotStates.owner_history)
 
         # Register callback queries
         self.dp.callback_query.register(self._on_callback)
@@ -99,66 +130,385 @@ class ApartmentBot:
             return True  # No restrictions
         return user_id in allowed
 
+    # ==================================================================
+    # Inline-menu UI
+    # ------------------------------------------------------------------
+    # The bot is menu-first: /start (or /menu) opens the main menu and every
+    # feature is reachable by tapping. Navigation between menu screens edits
+    # the current message in place; commands that produce long listings send
+    # fresh messages with a compact "back to menu" keyboard. Buttons that need
+    # free text (search, nickname, …) put the user into an FSM state.
+    # ==================================================================
+
+    @staticmethod
+    def _btn(text: str, data: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=data)
+
     def _get_keyboard(self, user_id: int = 0) -> InlineKeyboardMarkup:
-        is_admin = self._is_admin(user_id) if user_id else False
-        buttons = [
-            [
-                InlineKeyboardButton(text="🏠 Список", callback_data="list"),
-                InlineKeyboardButton(text="✅ Свободные", callback_data="free"),
-            ],
-            [
-                InlineKeyboardButton(text="🔍 Поиск", callback_data="search"),
-                InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Обновление", callback_data="last_update"),
-                InlineKeyboardButton(text="📉 Слёты", callback_data="crashday"),
-            ],
+        """Main menu. Kept under this name so long-listing handlers can reuse it."""
+        b = self._btn
+        rows = [
+            [b("🏠 Квартиры", "menu:apartments"), b("🏢 Каталог", "menu:catalog")],
+            [b("🔔 Подписки", "menu:subs"), b("🕐 Отчёты", "menu:reports")],
+            [b("📉 Слёты сегодня", "act:crashday"), b("🔄 Обновление", "act:last_update")],
         ]
-        if is_admin:
-            buttons.append([
-                InlineKeyboardButton(text="🔔 Гос. уведомления", callback_data="free_notify_toggle"),
-                InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
-            ])
-        else:
-            buttons.append([
-                InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
-            ])
-        return InlineKeyboardMarkup(inline_keyboard=buttons)
+        last = [b("❓ Помощь", "act:help")]
+        if user_id and self._is_admin(user_id):
+            last.insert(0, b("⚙️ Админ", "menu:admin"))
+        rows.append(last)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def _on_callback(self, query: CallbackQuery) -> None:
-        data = query.data
-        is_admin = self._is_admin(query.from_user.id)
+    def _back_kb(self, section: str = "main") -> InlineKeyboardMarkup:
+        """Compact keyboard appended to data listings: jump back to a menu."""
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            self._btn("⬅️ В меню", f"menu:{section}"),
+        ]])
 
-        if data == "free_notify_toggle":
+    _MENU_TEXT = {
+        "main": (
+            "<b>🏠 GTA5RP · Мониторинг недвижимости</b>\n"
+            "Выберите раздел 👇"
+        ),
+        "apartments": (
+            "<b>🏠 Квартиры</b>\n"
+            "Списки, статус и поиск по зданиям Murrieta."
+        ),
+        "catalog": (
+            "<b>🏢 Каталог владельцев</b>\n"
+            "Занятые дома и квартиры, поиск по владельцу, история ников."
+        ),
+        "reports": (
+            "<b>🕐 Отчёты</b>\n"
+            "Почасовая сводка слётов и смен ников, плюс гос-отчёт за пейдей "
+            "(слетевшие дома и квартиры после обновления карты)."
+        ),
+        "admin": (
+            "<b>⚙️ Администрирование</b>\n"
+            "Управление парсером и краш-детектором."
+        ),
+    }
+
+    def _menu_markup(self, section: str, uid: int) -> InlineKeyboardMarkup:
+        b = self._btn
+        if section == "apartments":
+            rows = [
+                [b("🏠 Все квартиры", "act:list"), b("✅ Свободные", "act:free")],
+                [b("🔴 Занятые", "act:occupied"), b("📊 Статистика", "act:stats")],
+                [b("🔍 Поиск", "ask:search"), b("ℹ️ Статус квартиры", "ask:status")],
+                [b("📋 История изменений", "ask:history")],
+                [b("⬅️ Назад", "menu:main")],
+            ]
+        elif section == "catalog":
+            rows = [
+                [b("🏢 Статус каталога", "act:realestate")],
+                [b("🏢 Здания", "pick:buildings"), b("🏠 Дома", "pick:houses")],
+                [b("👤 По владельцу", "ask:owners"), b("📜 История ников", "ask:owner_history")],
+                [b("🌐 Серверы", "act:servers")],
+                [b("⬅️ Назад", "menu:main")],
+            ]
+        elif section == "reports":
+            rows = [[b("🕐 Отчёт сейчас", "act:report_now")]]
+            if self._is_admin(uid):
+                rows.append([b("🔔 Авто-отчёт (вкл/выкл)", "adm:report_toggle")])
+                rows.append([b("🏛 Гос-отчёт за пейдей (вкл/выкл)", "adm:payday_toggle")])
+                rows.append([b("⚡ «Возможные слёты» (вкл/выкл)", "adm:possibly_toggle")])
+            rows.append([b("⬅️ Назад", "menu:main")])
+        elif section == "admin":
+            rows = [
+                [b("🔄 Запустить парсер", "adm:scrape")],
+                [b("🚨 Краш-статус", "adm:crash_status")],
+                [b("🟢 Краш вкл", "adm:crash_on"), b("🔴 Краш выкл", "adm:crash_off")],
+                [b("🗺 Проверить карту", "adm:map_check")],
+                [b("🔔 Гос-уведомления (вкл/выкл)", "adm:free_notify")],
+                [b("⬅️ Назад", "menu:main")],
+            ]
+        else:  # main
+            return self._get_keyboard(uid)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _subs_markup(self, uid: int) -> InlineKeyboardMarkup:
+        """Subscriptions screen: current subs (tap to remove) + subscribe entry."""
+        from app.database.repository import SubscriptionRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            subs = await repo.list_for_user(uid)
+
+        kind_ru = {"any": "все", "house": "дома", "apartment": "кв."}
+        rows = []
+        for s in subs:
+            name = sid_to_server_name(s.server_sid) or f"sid {s.server_sid}"
+            rows.append([self._btn(
+                f"❌ {name} · {kind_ru.get(s.kind, s.kind)}", f"sub:del:{s.server_sid}"
+            )])
+        rows.append([self._btn("➕ Подписаться", "menu:subpick")])
+        rows.append([self._btn("⬅️ Назад", "menu:main")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _server_pick_markup(self, action: str) -> InlineKeyboardMarkup:
+        """One button per monitored server for the given action (buildings/houses/sub)."""
+        from app.scraper.realestate_client import resolve_servers
+
+        servers = resolve_servers(self.settings.realestate.server_names)
+        rows = [[self._btn(f"🌐 {name}", f"{action}:{sid}")] for sid, name in servers.items()]
+        back = "menu:subs" if action == "subkind" else "menu:catalog"
+        rows.append([self._btn("⬅️ Назад", back)])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _sub_kind_markup(self, sid: str) -> InlineKeyboardMarkup:
+        from app.scraper.realestate_client import sid_to_server_name
+        name = sid_to_server_name(sid) or f"sid {sid}"
+        b = self._btn
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [b(f"🔔 {name}: все объекты", f"sub:add:{sid}:any")],
+            [b("🏠 только дома", f"sub:add:{sid}:house"),
+             b("🏢 только квартиры", f"sub:add:{sid}:apartment")],
+            [b("⬅️ Назад", "menu:subpick")],
+        ])
+
+    async def _edit_menu(self, query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+        """Edit the message in place; fall back to a new message if edit fails."""
+        try:
+            await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest:
+            # Message has no editable text (e.g. it was a data listing) or is
+            # unchanged — just send a fresh menu instead.
+            await query.message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+    async def _on_callback(self, query: CallbackQuery, state: FSMContext) -> None:
+        data = query.data or ""
+        uid = query.from_user.id
+        is_admin = self._is_admin(uid)
+
+        # --- Menu navigation (edit in place) ---
+        if data.startswith("menu:"):
+            section = data.split(":", 1)[1]
+            await query.answer()
+            if section == "subs":
+                await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
+                                      "Уведомления приходят вам лично по выбранным серверам.",
+                                      await self._subs_markup(uid))
+            elif section == "subpick":
+                await self._edit_menu(query, "<b>➕ Выберите сервер</b>",
+                                      self._server_pick_markup("subkind"))
+            elif section == "admin" and not is_admin:
+                await query.answer("⛔ Только для админов", show_alert=True)
+            else:
+                await self._edit_menu(query, self._MENU_TEXT.get(section, self._MENU_TEXT["main"]),
+                                      self._menu_markup(section, uid))
+            return
+
+        # --- Server picker for catalog listings ---
+        if data.startswith("pick:"):
+            action = data.split(":", 1)[1]  # buildings | houses
+            from app.scraper.realestate_client import resolve_servers
+            servers = resolve_servers(self.settings.realestate.server_names)
+            await query.answer()
+            if len(servers) <= 1:
+                sid = next(iter(servers), None)
+                await self._run_catalog(action, query.message, sid)
+            else:
+                await self._edit_menu(query, "<b>🌐 Выберите сервер</b>",
+                                      self._server_pick_markup(action))
+            return
+
+        if data.startswith("buildings:") or data.startswith("houses:"):
+            action, sid = data.split(":", 1)
+            await query.answer()
+            await self._run_catalog(action, query.message, sid)
+            return
+
+        # --- Subscriptions ---
+        if data.startswith("subkind:"):
+            sid = data.split(":", 1)[1]
+            await query.answer()
+            await self._edit_menu(query, "<b>Выберите тип объектов</b>", self._sub_kind_markup(sid))
+            return
+        if data.startswith("sub:add:"):
+            _, _, sid, kind = data.split(":", 3)
+            await self._do_subscribe(uid, sid, kind)
+            await query.answer("✅ Подписка оформлена")
+            await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
+                                  "Уведомления приходят вам лично по выбранным серверам.",
+                                  await self._subs_markup(uid))
+            return
+        if data.startswith("sub:del:"):
+            sid = data.split(":", 2)[2]
+            await self._do_unsubscribe(uid, sid)
+            await query.answer("❌ Подписка удалена")
+            await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
+                                  "Уведомления приходят вам лично по выбранным серверам.",
+                                  await self._subs_markup(uid))
+            return
+
+        # --- Text-input actions: enter FSM state and prompt ---
+        if data.startswith("ask:"):
+            await query.answer()
+            await self._prompt_input(query.message, state, data.split(":", 1)[1])
+            return
+
+        # --- Admin actions ---
+        if data.startswith("adm:"):
             if not is_admin:
                 await query.answer("⛔ Только для админов", show_alert=True)
                 return
             await query.answer()
-            await self._toggle_free_notify(query.message)
+            await self._run_admin(data.split(":", 1)[1], query.message, uid)
             return
 
+        # --- Simple data actions (fresh message) ---
+        if data.startswith("act:"):
+            await query.answer()
+            await self._run_action(data.split(":", 1)[1], query.message, uid)
+            return
+
+        await query.answer("Неизвестная команда", show_alert=True)
+
+    async def cmd_menu(self, message: Message, state: Optional[FSMContext] = None) -> None:
+        """Open the main inline menu (also the escape hatch from any FSM prompt)."""
+        if state is not None:
+            await state.clear()
+        await message.answer(self._MENU_TEXT["main"], parse_mode="HTML",
+                             reply_markup=self._get_keyboard(message.from_user.id))
+
+    # ---- Callback action dispatch ----
+
+    async def _run_action(self, action: str, message: Message, uid: int) -> None:
         handlers = {
             "list": self.cmd_list,
             "free": self.cmd_free,
-            "search": self._callback_search,
+            "occupied": self.cmd_occupied,
             "stats": self.cmd_stats,
             "last_update": self.cmd_last_update,
             "crashday": self.cmd_crashday,
+            "realestate": self.cmd_realestate,
+            "servers": self.cmd_servers,
             "help": self.cmd_help,
+            "report_now": self._report_now,
         }
-        handler = handlers.get(data)
-        if handler and data == "search":
-            await query.answer()
-            await query.message.answer("🔍 Введите /search <b>название</b> для поиска квартиры", parse_mode="HTML")
-        elif handler:
-            await query.answer()
-            await handler(query.message)
-        else:
-            await query.answer("Неизвестная команда", show_alert=True)
+        handler = handlers.get(action)
+        if handler:
+            await handler(message, user_id=uid)
 
-    async def _callback_search(self, message: Message) -> None:
-        pass
+    async def _run_catalog(self, action: str, message: Message, sid: Optional[str]) -> None:
+        """Render a buildings/houses listing for a specific server sid."""
+        if not sid:
+            await message.answer("⚠️ Сервер не распознан.")
+            return
+        if action == "buildings":
+            await self._render_buildings(message, sid)
+        elif action == "houses":
+            await self._render_houses(message, sid, query=None)
+
+    async def _run_admin(self, action: str, message: Message, uid: int) -> None:
+        if action == "report_toggle":
+            await self._toggle_setting_report(message, "hourly_report", "Почасовой отчёт")
+        elif action == "payday_toggle":
+            await self._toggle_setting_report(message, "payday_report", "Гос-отчёт за пейдей")
+        elif action == "possibly_toggle":
+            await self._toggle_setting_report(message, "notify_possibly_freed",
+                                              "Уведомления о «возможных слётах»")
+        elif action == "free_notify":
+            await self._toggle_free_notify(message)
+        elif action == "scrape":
+            await self.cmd_scrape(message, user_id=uid)
+        elif action == "crash_status":
+            await self.cmd_crash_status(message, user_id=uid)
+        elif action == "crash_on":
+            await self.cmd_crash_on(message, user_id=uid)
+        elif action == "crash_off":
+            await self.cmd_crash_off(message, user_id=uid)
+        elif action == "map_check":
+            await self.cmd_map_check(message, user_id=uid)
+
+    async def _prompt_input(self, message: Message, state: FSMContext, kind: str) -> None:
+        prompts = {
+            "search": (BotStates.search, "🔍 Введите <b>название</b> квартиры для поиска:"),
+            "status": (BotStates.status, "ℹ️ Введите <b>ID или название</b> квартиры:"),
+            "history": (BotStates.history, "📋 Введите <b>ID квартиры</b> для истории изменений:"),
+            "owners": (BotStates.owners, "👤 Введите <b>ник владельца</b>:"),
+            "building": (BotStates.building, "🏢 Введите <b>название здания</b>:"),
+            "owner_history": (BotStates.owner_history,
+                              "📜 Введите <b>ключ объекта</b> (напр. <code>20:house:242</code>):"),
+        }
+        st, text = prompts[kind]
+        await state.set_state(st)
+        await message.answer(text + "\n\n<i>Отмена: /menu</i>", parse_mode="HTML")
+
+    # ---- FSM state handlers (read the next message, then run the query) ----
+
+    @staticmethod
+    async def _state_text(message: Message, state: FSMContext) -> Optional[str]:
+        """Return the trimmed text of a state reply, or None if it was not text.
+
+        Clears the state either way so a stray photo/sticker doesn't trap the
+        user; on non-text input it nudges them back to the menu.
+        """
+        await state.clear()
+        text = (message.text or "").strip()
+        if not text:
+            await message.answer("⚠️ Ожидался текст. Откройте меню: /menu")
+            return None
+        return text
+
+    async def _state_search(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_search(message, text)
+
+    async def _state_status(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_status(message, text)
+
+    async def _state_history(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_history(message, text)
+
+    async def _state_owners(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_owners(message, self._current_sid(),
+                                      self.settings.realestate.server_name, text)
+
+    async def _state_building(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_building(message, self._current_sid(),
+                                        self.settings.realestate.server_name, text)
+
+    async def _state_owner_history(self, message: Message, state: FSMContext) -> None:
+        text = await self._state_text(message, state)
+        if text is not None:
+            await self._render_owner_history(message, text)
+
+    # ---- Subscription helpers (use the REAL invoking user id) ----
+
+    async def _do_subscribe(self, uid: int, sid: str, kind: str) -> None:
+        from app.database.repository import SubscriptionRepository
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            await repo.subscribe(uid, sid, kind=kind)
+
+    async def _do_unsubscribe(self, uid: int, sid: str) -> None:
+        from app.database.repository import SubscriptionRepository
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            await repo.unsubscribe(uid, sid)
+
+    async def _toggle_setting_report(self, message: Message, key: str, label: str) -> None:
+        from app.database.repository import ScraperSettingsRepository
+        async with DatabaseSession.get_session_context() as session:
+            repo = ScraperSettingsRepository(session)
+            current = await repo.get(key)
+            if current is None:
+                current = "1"
+            new_val = "0" if current == "1" else "1"
+            await repo.set(key, new_val)
+        status = "🔔 включён" if new_val == "1" else "🔕 выключен"
+        await message.answer(f"{label}: {status}.")
 
     async def _get_free_notify_setting(self) -> str:
         async with DatabaseSession.get_session_context() as session:
@@ -193,27 +543,31 @@ class ApartmentBot:
         )
         await message.answer(text, parse_mode="HTML")
 
-    async def cmd_realestate(self, message: Message) -> None:
+    async def cmd_realestate(self, message: Message, user_id: Optional[int] = None) -> None:
         """Show the /realestate source status and recent freed objects."""
         from app.database.repository import RealEstateRepository
-        from app.scraper.realestate_client import server_name_to_sid
+        from app.scraper.realestate_client import resolve_servers
 
         rs = self.settings.realestate
-        sid = server_name_to_sid(rs.server_name)
+        servers = resolve_servers(rs.server_names)
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
-            occupied = await repo.count_occupied(sid) if sid else 0
+            occupied_by_server = {
+                sid: await repo.count_occupied(sid) for sid in servers
+            }
             recent = await repo.get_recent_events(limit=10, event_type="freed")
 
         status = "🟢 Включён" if rs.enabled else "🔴 Выключен"
         lines = [
             "<b>🏢 Каталог /realestate</b>",
             f"┣ Источник: {status}",
-            f"┣ Сервер: {rs.server_name} (sid {sid or '—'})",
             f"┣ Интервал: {rs.interval}s",
-            f"┗ Занятых объектов: {occupied}",
+            "┣ Серверы:",
         ]
+        for sid, name in servers.items():
+            lines.append(f"┃   • {name} (sid {sid}) — занятых: {occupied_by_server.get(sid, 0)}")
+        lines.append("┗ /subscribe &lt;сервер&gt; — подписка на уведомления")
 
         if recent:
             lines.append("\n<b>🎉 Последние освобождения:</b>")
@@ -221,11 +575,14 @@ class ApartmentBot:
                 when = e.detected_at.strftime("%d.%m %H:%M") if e.detected_at else "—"
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 price = f" · {e.price:,}".replace(",", " ") if e.price else ""
-                lines.append(f"• {when} — {kind_ru} {e.name or e.object_key}{price}")
+                srv = servers.get(e.server_sid)
+                srv_tag = f" [{srv}]" if srv else ""
+                lines.append(f"• {when}{srv_tag} — {kind_ru} {e.name or e.object_key}{price}")
         else:
             lines.append("\n<i>Освобождений пока не зафиксировано.</i>")
 
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("\n".join(lines), parse_mode="HTML",
+                             reply_markup=self._back_kb("catalog"))
 
     # ---- Catalog: owner listings (houses / apartments) ----
 
@@ -236,41 +593,91 @@ class ApartmentBot:
             return "—"
         return f"{price:,}".replace(",", " ")
 
-    async def _reply_chunked(self, message: Message, lines: List[str], header: str = "") -> None:
-        """Send potentially long line lists as multiple <=4000-char messages."""
+    async def _reply_chunked(self, message: Message, lines: List[str], header: str = "",
+                             footer_kb: Optional[InlineKeyboardMarkup] = None) -> None:
+        """Send potentially long line lists as multiple <=4000-char messages.
+
+        `footer_kb`, when given, is attached to the final chunk so listings sent
+        from the inline menu carry a "back to menu" button.
+        """
         if not lines:
-            await message.answer(header or "Нет данных.", parse_mode="HTML")
+            await message.answer(header or "Нет данных.", parse_mode="HTML", reply_markup=footer_kb)
             return
+        chunks: List[str] = []
         buf = header
         for line in lines:
             piece = ("\n" if buf else "") + line
             if len(buf) + len(piece) > 4000:
-                await message.answer(buf, parse_mode="HTML")
+                chunks.append(buf)
                 buf = line
             else:
                 buf += piece
         if buf:
-            await message.answer(buf, parse_mode="HTML")
+            chunks.append(buf)
+        for i, chunk in enumerate(chunks):
+            kb = footer_kb if i == len(chunks) - 1 else None
+            await message.answer(chunk, parse_mode="HTML", reply_markup=kb)
 
     def _current_sid(self) -> Optional[str]:
         from app.scraper.realestate_client import server_name_to_sid
         return server_name_to_sid(self.settings.realestate.server_name)
 
+    def _parse_server_and_query(self, text: str, command: str) -> tuple:
+        """Split a catalog command's args into (sid, server_name, remaining_query).
+
+        A leading `server=<name>` or `@<name>` token, or a bare first token that
+        matches a monitored server name, selects that server; otherwise the
+        primary (REALESTATE_SERVER) is used and the whole arg is the query. This
+        keeps single-server usage unchanged while allowing per-server queries.
+        """
+        from app.scraper.realestate_client import server_name_to_sid, resolve_servers
+
+        arg = text.replace(command, "", 1).strip()
+        monitored = resolve_servers(self.settings.realestate.server_names)
+        names_by_lower = {n.lower(): (s, n) for s, n in monitored.items()}
+
+        chosen_sid = None
+        chosen_name = None
+        if arg:
+            first, _, rest = arg.partition(" ")
+            token = first
+            if token.startswith("server="):
+                token = token[len("server="):]
+            elif token.startswith("@"):
+                token = token[1:]
+            hit = names_by_lower.get(token.lower())
+            if hit:
+                chosen_sid, chosen_name = hit
+                arg = rest.strip()
+
+        if chosen_sid is None:
+            chosen_name = self.settings.realestate.server_name
+            chosen_sid = server_name_to_sid(chosen_name)
+
+        return chosen_sid, chosen_name, arg
+
     async def cmd_buildings(self, message: Message) -> None:
         """List apartment buildings with free/total counts."""
-        from app.database.repository import RealEstateRepository
+        sid, server_name, _ = self._parse_server_and_query(message.text, "/buildings")
+        await self._render_buildings(message, sid, server_name)
 
-        sid = self._current_sid()
+    async def _render_buildings(self, message: Message, sid: Optional[str],
+                                server_name: Optional[str] = None) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
         if not sid:
             await message.answer("⚠️ Сервер не распознан.")
             return
+        server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
             buildings = await repo.get_buildings(sid)
 
         if not buildings:
-            await message.answer("🏢 Данных о зданиях пока нет. Дождитесь первого сканирования.")
+            await message.answer("🏢 Данных о зданиях пока нет. Дождитесь первого сканирования.",
+                                 reply_markup=self._back_kb("catalog"))
             return
 
         lines = []
@@ -280,13 +687,19 @@ class ApartmentBot:
             icon = "🟢" if free else "🔴"
             lines.append(f"{icon} {b.name} — свободно {free}/{total}")
         lines.append("\n<i>Владельцы: /building &lt;название&gt;</i>")
-        await self._reply_chunked(message, lines, "<b>🏢 Жилые здания</b>\n")
+        await self._reply_chunked(message, lines, f"<b>🏢 Жилые здания · {server_name}</b>\n",
+                                  footer_kb=self._back_kb("catalog"))
 
     async def cmd_building(self, message: Message) -> None:
         """List all apartments (with owners) inside a building."""
-        from app.database.repository import RealEstateRepository
+        sid, server_name, query = self._parse_server_and_query(message.text, "/building")
+        await self._render_building(message, sid, server_name, query)
 
-        query = message.text.replace("/building", "").strip()
+    async def _render_building(self, message: Message, sid: Optional[str],
+                               server_name: Optional[str], query: str) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
         if not query:
             await message.answer(
                 "Укажите название здания. Пример: <code>/building Eclipse Towers</code>",
@@ -294,10 +707,10 @@ class ApartmentBot:
             )
             return
 
-        sid = self._current_sid()
         if not sid:
             await message.answer("⚠️ Сервер не распознан.")
             return
+        server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -326,18 +739,23 @@ class ApartmentBot:
                 f"🔴 {u.name or ('#' + str(u.unit_id))} · ID #{u.unit_id}{cls}\n"
                 f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
             )
-        header = f"<b>🏢 {building_name}</b>\nЗанятых квартир: {len(units)}\n\n"
-        await self._reply_chunked(message, lines, header)
+        header = f"<b>🏢 {building_name} · {server_name}</b>\nЗанятых квартир: {len(units)}\n\n"
+        await self._reply_chunked(message, lines, header, footer_kb=self._back_kb("catalog"))
 
     async def cmd_houses(self, message: Message) -> None:
         """List occupied private houses with owners; optional search filter."""
-        from app.database.repository import RealEstateRepository
+        sid, server_name, query = self._parse_server_and_query(message.text, "/houses")
+        await self._render_houses(message, sid, server_name, query or None)
 
-        query = message.text.replace("/houses", "").strip()
-        sid = self._current_sid()
+    async def _render_houses(self, message: Message, sid: Optional[str],
+                             server_name: Optional[str] = None, query: Optional[str] = None) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
         if not sid:
             await message.answer("⚠️ Сервер не распознан.")
             return
+        server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -361,16 +779,21 @@ class ApartmentBot:
                 f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
             )
         title = f"поиск «{query}»" if query else "все занятые"
-        header = f"<b>🏠 Дома · {title}</b>\nНайдено: {len(houses)}\n\n"
+        header = f"<b>🏠 Дома · {server_name} · {title}</b>\nНайдено: {len(houses)}\n\n"
         if not query and len(houses) >= 300:
             header += "<i>Показаны первые 300. Уточните: /houses &lt;текст&gt;</i>\n\n"
-        await self._reply_chunked(message, lines, header)
+        await self._reply_chunked(message, lines, header, footer_kb=self._back_kb("catalog"))
 
     async def cmd_owners(self, message: Message) -> None:
         """Find all objects (houses + apartments) owned by a nickname."""
-        from app.database.repository import RealEstateRepository
+        sid, server_name, query = self._parse_server_and_query(message.text, "/owners")
+        await self._render_owners(message, sid, server_name, query)
 
-        query = message.text.replace("/owners", "").strip()
+    async def _render_owners(self, message: Message, sid: Optional[str],
+                             server_name: Optional[str], query: str) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
         if not query:
             await message.answer(
                 "Укажите ник. Пример: <code>/owners Kirill_Morales</code>",
@@ -378,10 +801,10 @@ class ApartmentBot:
             )
             return
 
-        sid = self._current_sid()
         if not sid:
             await message.answer("⚠️ Сервер не распознан.")
             return
+        server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -390,7 +813,8 @@ class ApartmentBot:
         # list_occupied searches name+owner; keep only owner matches here.
         objs = [o for o in objs if query.lower() in (o.owner_name or "").lower()]
         if not objs:
-            await message.answer(f"👤 Объектов у «{query}» не найдено.")
+            await message.answer(f"👤 Объектов у «{query}» не найдено.",
+                                 reply_markup=self._back_kb("catalog"))
             return
 
         houses = [o for o in objs if o.kind == "house"]
@@ -418,16 +842,140 @@ class ApartmentBot:
                 )
 
         header = (
-            f"<b>👤 Объекты игрока «{query}»</b>\n"
+            f"<b>👤 Объекты игрока «{query}» · {server_name}</b>\n"
             f"🏠 Домов: {len(houses)} · 🏢 Квартир: {len(apts)}\n\n"
         )
-        await self._reply_chunked(message, lines, header)
+        await self._reply_chunked(message, lines, header, footer_kb=self._back_kb("catalog"))
+
+    # ---- Per-server notification subscriptions ----
+
+    async def cmd_servers(self, message: Message, user_id: Optional[int] = None) -> None:
+        """List the servers currently monitored for realestate changes."""
+        from app.scraper.realestate_client import resolve_servers
+
+        servers = resolve_servers(self.settings.realestate.server_names)
+        if not servers:
+            await message.answer("⚠️ Нет настроенных серверов (REALESTATE_SERVERS).",
+                                 reply_markup=self._back_kb("catalog"))
+            return
+
+        lines = ["<b>🌐 Отслеживаемые серверы</b>"]
+        for sid, name in servers.items():
+            lines.append(f"• {name} (sid {sid})")
+        lines.append("\n<i>Подписка: /subscribe &lt;сервер&gt; [house|apartment]</i>")
+        await message.answer("\n".join(lines), parse_mode="HTML",
+                             reply_markup=self._back_kb("catalog"))
+
+    async def cmd_subscribe(self, message: Message) -> None:
+        """Subscribe the current user to freed-object alerts for a server."""
+        from app.database.repository import SubscriptionRepository
+        from app.scraper.realestate_client import resolve_servers, sid_to_server_name
+
+        arg = message.text.replace("/subscribe", "", 1).strip()
+        servers = resolve_servers(self.settings.realestate.server_names)
+        if not arg:
+            names = ", ".join(servers.values()) or "—"
+            await message.answer(
+                "Укажите сервер. Пример: <code>/subscribe Strawberry</code>\n"
+                f"Доступные: {names}\n"
+                "Можно уточнить тип: <code>/subscribe Strawberry house</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        parts = arg.split()
+        server_token = parts[0]
+        kind = "any"
+        if len(parts) > 1:
+            k = parts[1].lower()
+            if k in ("house", "houses", "дом", "дома"):
+                kind = "house"
+            elif k in ("apartment", "apartments", "apt", "кв", "квартира", "квартиры"):
+                kind = "apartment"
+
+        names_by_lower = {n.lower(): (s, n) for s, n in servers.items()}
+        hit = names_by_lower.get(server_token.lower())
+        if not hit:
+            names = ", ".join(servers.values()) or "—"
+            await message.answer(
+                f"⚠️ Сервер «{server_token}» не отслеживается.\nДоступные: {names}"
+            )
+            return
+        sid, name = hit
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            await repo.subscribe(message.from_user.id, sid, kind=kind)
+
+        kind_ru = {"any": "все объекты", "house": "только дома", "apartment": "только квартиры"}[kind]
+        await message.answer(
+            f"✅ Подписка оформлена: <b>{name}</b> ({kind_ru}).\n"
+            "Уведомления о слётах будут приходить вам лично.",
+            parse_mode="HTML",
+        )
+
+    async def cmd_unsubscribe(self, message: Message) -> None:
+        """Remove the current user's subscription to a server."""
+        from app.database.repository import SubscriptionRepository
+        from app.scraper.realestate_client import resolve_servers
+
+        arg = message.text.replace("/unsubscribe", "", 1).strip()
+        servers = resolve_servers(self.settings.realestate.server_names)
+        if not arg:
+            await message.answer(
+                "Укажите сервер. Пример: <code>/unsubscribe Strawberry</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        names_by_lower = {n.lower(): (s, n) for s, n in servers.items()}
+        hit = names_by_lower.get(arg.split()[0].lower())
+        if not hit:
+            await message.answer(f"⚠️ Сервер «{arg}» не найден.")
+            return
+        sid, name = hit
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            removed = await repo.unsubscribe(message.from_user.id, sid)
+
+        if removed:
+            await message.answer(f"✅ Подписка на <b>{name}</b> отменена.", parse_mode="HTML")
+        else:
+            await message.answer(f"ℹ️ У вас не было подписки на «{name}».")
+
+    async def cmd_subscriptions(self, message: Message) -> None:
+        """Show the current user's active subscriptions."""
+        from app.database.repository import SubscriptionRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = SubscriptionRepository(session)
+            subs = await repo.list_for_user(message.from_user.id)
+
+        if not subs:
+            await message.answer(
+                "У вас нет активных подписок.\n"
+                "Оформить: <code>/subscribe &lt;сервер&gt;</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        kind_ru = {"any": "все", "house": "дома", "apartment": "квартиры"}
+        lines = ["<b>🔔 Ваши подписки</b>"]
+        for s in subs:
+            name = sid_to_server_name(s.server_sid) or f"sid {s.server_sid}"
+            lines.append(f"• {name} — {kind_ru.get(s.kind, s.kind)}")
+        await message.answer("\n".join(lines), parse_mode="HTML")
 
     async def cmd_owner_history(self, message: Message) -> None:
         """Show the owner-nickname timeline for one object by its key."""
+        query = message.text.replace("/owner_history", "").strip()
+        await self._render_owner_history(message, query)
+
+    async def _render_owner_history(self, message: Message, query: str) -> None:
         from app.database.repository import RealEstateRepository
 
-        query = message.text.replace("/owner_history", "").strip()
         if not query:
             await message.answer(
                 "Укажите ключ объекта. Пример: <code>/owner_history 20:house:242</code>\n"
@@ -442,7 +990,8 @@ class ApartmentBot:
             history = await repo.get_owner_history(query, limit=30)
 
         if not obj and not history:
-            await message.answer(f"🔍 Объект «{query}» не найден.")
+            await message.answer(f"🔍 Объект «{query}» не найден.",
+                                 reply_markup=self._back_kb("catalog"))
             return
 
         title = (obj.name if obj else query) or query
@@ -456,7 +1005,8 @@ class ApartmentBot:
                 lines.append(
                     f"• {when}: {h.previous_owner or '—'} → {h.owner_name or '—'}{pd}"
                 )
-        await self._reply_chunked(message, lines[1:], lines[0] + "\n")
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("catalog"))
 
     async def cmd_possibly_notify(self, message: Message) -> None:
         """Toggle notifications for 'possibly freed' (Payday owner-change) events."""
@@ -505,6 +1055,13 @@ class ApartmentBot:
             await message.answer(f"Почасовой отчёт {status}.")
             return
 
+        await self._report_now(message)
+
+    async def _report_now(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Build and send the last-hour Payday report immediately."""
+        from datetime import datetime, timezone, timedelta
+        from app.database.repository import RealEstateRepository
+
         now = datetime.now(timezone.utc)
         since = now - timedelta(hours=1)
         async with DatabaseSession.get_session_context() as session:
@@ -537,65 +1094,47 @@ class ApartmentBot:
         elif not events:
             lines.append("\n<i>За этот час изменений не было.</i>")
 
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await message.answer("\n".join(lines), parse_mode="HTML",
+                             reply_markup=self._back_kb("reports"))
 
     async def cmd_start(self, message: Message) -> None:
         uid = message.from_user.id
         text = (
-            "<b>🏠 GTA5RP · Murrieta</b>\n"
-            "┗ Мониторинг квартир\n\n"
-            "📌 <b>Команды:</b>\n"
-            "  /list — список всех квартир\n"
-            "  /free — свободные\n"
-            "  /search <i>текст</i> — поиск\n"
-            "  /status <i>id</i> — статус\n"
-            "  /stats — статистика\n"
-            "  /realestate — каталог: освобождения\n"
-            "  /buildings — жилые здания (кол-во свободных)\n"
-            "  /building <i>название</i> — квартиры здания\n"
-            "  /houses — дома с владельцами\n"
-            "  /owners <i>ник</i> — поиск по владельцу\n"
-            "  /crashday — слёты за сегодня\n"
-            "  /last_update — последний запуск\n\n"
-            "<i>Также используйте кнопки ниже</i> 👇"
+            "<b>🏠 GTA5RP · Мониторинг недвижимости</b>\n"
+            "Слежу за квартирами, домами и слётами.\n\n"
+            "Всё управление — через кнопки ниже 👇\n"
+            "<i>Открыть меню в любой момент: /menu</i>"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=self._get_keyboard(uid))
 
-    async def cmd_help(self, message: Message) -> None:
+    async def cmd_help(self, message: Message, user_id: Optional[int] = None) -> None:
         text = (
             "📖 <b>Помощь</b>\n\n"
-            "  /list — список всех квартир\n"
-            "  /search <i>текст</i> — поиск по названию\n"
-            "  /status <i>id</i> — инфо о квартире\n"
-            "  /free — свободные квартиры\n"
-            "  /occupied — занятые квартиры\n"
-            "  /history <i>id</i> — история изменений\n"
-            "  /last_update — время обновления\n"
-            "  /stats — статистика системы\n"
-            "  /crashday — слёты за сегодня\n"
-            "  /realestate — каталог /realestate (освобождения)\n\n"
-            "<b>🏢 Каталог владельцев:</b>\n"
-            "  /buildings — список зданий (квартиры)\n"
-            "  /building <i>название</i> — владельцы квартир в здании\n"
-            "  /houses — список занятых домов\n"
-            "  /owners <i>ник</i> — поиск объектов по владельцу\n"
-            "  /owner_history <i>ключ</i> — история ников объекта\n\n"
-            "<b>🕐 Отчёты:</b>\n"
-            "  /report — отчёт за последний час (слёты, смены ников)\n"
-            "  /report on|off — авто-отчёт каждый час\n"
-            "  /possibly_notify — вкл/выкл «возможные слёты»"
+            "Бот управляется кнопками — нажмите /menu, чтобы открыть меню.\n"
+            "Разделы: 🏠 Квартиры · 🏢 Каталог · 🔔 Подписки · 🕐 Отчёты · ⚙️ Админ.\n\n"
+            "<b>Команды тоже работают:</b>\n"
+            "  /list /free /occupied /stats — квартиры\n"
+            "  /search <i>текст</i> · /status <i>id</i> · /history <i>id</i>\n"
+            "  /realestate — каталог освобождений\n"
+            "  /buildings · /building <i>название</i> — здания и квартиры\n"
+            "  /houses · /owners <i>ник</i> · /owner_history <i>ключ</i>\n"
+            "  /report [on|off] · /possibly_notify — отчёты\n"
+            "  /servers · /subscribe <i>сервер</i> [house|apartment]\n"
+            "  /unsubscribe <i>сервер</i> · /subscriptions — подписки\n"
+            "  /crashday · /last_update\n\n"
+            "<i>Мультисервер: /houses Strawberry, /buildings @Sunrise</i>"
         )
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("main"))
 
-    async def cmd_list(self, message: Message) -> None:
-        uid = message.from_user.id
+    async def cmd_list(self, message: Message, user_id: Optional[int] = None) -> None:
+        uid = user_id or message.from_user.id
         async with DatabaseSession.get_session_context() as session:
             repo = ApartmentRepository(session)
             apartments = await repo.get_all()
             stats = await repo.get_statistics()
 
         if not apartments:
-            await message.answer("🏠 Нет данных о квартирах.")
+            await message.answer("🏠 Нет данных о квартирах.", reply_markup=self._back_kb("apartments"))
             return
 
         free_count = sum(1 for a in apartments if a.free_apartments and a.free_apartments > 0)
@@ -616,16 +1155,14 @@ class ApartmentBot:
             total = apt.total_apartments or 0
             lines.append(f"{icon} {i:02d}. {apt.name} — {status} | {free}/{total}")
 
-        kb = self._get_keyboard(uid)
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            for i in range(0, len(text), 4000):
-                await message.answer(text[i:i+4000], parse_mode="HTML", reply_markup=kb)
-        else:
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("apartments"))
 
     async def cmd_status(self, message: Message) -> None:
         args = message.text.replace("/status", "").strip()
+        await self._render_status(message, args)
+
+    async def _render_status(self, message: Message, args: str) -> None:
         if not args:
             await message.answer("Укажите ID или название. Пример: /status 1")
             return
@@ -640,7 +1177,8 @@ class ApartmentBot:
                 apartment = results[0] if results else None
 
         if not apartment:
-            await message.answer(f"Квартира '{args}' не найдена.")
+            await message.answer(f"Квартира '{args}' не найдена.",
+                                 reply_markup=self._back_kb("apartments"))
             return
 
         free = apartment.free_apartments or 0
@@ -666,42 +1204,45 @@ class ApartmentBot:
         if apartment.last_updated:
             text += f"\n\n🕐 {apartment.last_updated.strftime('%d.%m.%Y %H:%M:%S')}"
 
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("apartments"))
 
-    async def cmd_free(self, message: Message) -> None:
-        uid = message.from_user.id
+    async def cmd_free(self, message: Message, user_id: Optional[int] = None) -> None:
         async with DatabaseSession.get_session_context() as session:
             repo = ApartmentRepository(session)
             free_apts = await repo.get_free_apartments()
             stats = await repo.get_statistics()
 
         if not free_apts:
-            await message.answer("😢 Нет свободных квартир.")
+            await message.answer("😢 Нет свободных квартир.", reply_markup=self._back_kb("apartments"))
             return
 
         lines = [f"<b>🟢 Свободно: {stats['total_free']}/{stats['total_units']}</b>\n"]
         for i, apt in enumerate(free_apts, 1):
             lines.append(f"{i:02d}. <b>{apt.name}</b> — свободно {apt.free_apartments}")
-        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=self._get_keyboard(uid))
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("apartments"))
 
-    async def cmd_occupied(self, message: Message) -> None:
+    async def cmd_occupied(self, message: Message, user_id: Optional[int] = None) -> None:
         async with DatabaseSession.get_session_context() as session:
             repo = ApartmentRepository(session)
             apartments = await repo.get_all()
 
         occupied = [a for a in apartments if a.free_apartments == 0 and a.total_apartments and a.total_apartments > 0]
         if not occupied:
-            await message.answer("🎉 Все квартиры свободны!")
+            await message.answer("🎉 Все квартиры свободны!", reply_markup=self._back_kb("apartments"))
             return
 
         lines = ["<b>🔴 Полностью занятые</b>\n"]
         for i, apt in enumerate(occupied, 1):
             lines.append(f"{i:02d}. {apt.name} — {apt.total_apartments}/{apt.total_apartments}")
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("apartments"))
 
     async def cmd_history(self, message: Message) -> None:
         args = message.text.replace("/history", "").strip()
+        await self._render_history(message, args)
 
+    async def _render_history(self, message: Message, args: str) -> None:
         async with DatabaseSession.get_session_context() as session:
             change_repo = ChangeRepository(session)
             if args:
@@ -713,18 +1254,21 @@ class ApartmentBot:
                     return
 
                 if not changes:
-                    await message.answer(f"Нет изменений для квартиры #{args}.")
+                    await message.answer(f"Нет изменений для квартиры #{args}.",
+                                         reply_markup=self._back_kb("apartments"))
                     return
 
                 lines = [f"<b>📋 История · кв. #{args}</b>\n"]
                 for c in changes:
                     t = c.detected_at.strftime("%d.%m %H:%M") if c.detected_at else "?"
                     lines.append(f"[{t}] {c.field_name}: {c.old_value or '—'} → {c.new_value}")
-                await message.answer("\n".join(lines), parse_mode="HTML")
+                await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                          footer_kb=self._back_kb("apartments"))
             else:
                 changes = await change_repo.get_recent(limit=10)
                 if not changes:
-                    await message.answer("Изменений пока нет.")
+                    await message.answer("Изменений пока нет.",
+                                         reply_markup=self._back_kb("apartments"))
                     return
 
                 lines = ["<b>📋 Последние изменения</b>\n"]
@@ -732,16 +1276,17 @@ class ApartmentBot:
                     t = c.detected_at.strftime("%d.%m %H:%M") if c.detected_at else "?"
                     name = c.apartment.name if c.apartment else "?"
                     lines.append(f"[{t}] {name}: {c.field_name}")
-                await message.answer("\n".join(lines), parse_mode="HTML")
+                await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                          footer_kb=self._back_kb("apartments"))
 
-    async def cmd_last_update(self, message: Message) -> None:
-        uid = message.from_user.id
+    async def cmd_last_update(self, message: Message, user_id: Optional[int] = None) -> None:
+        uid = user_id or message.from_user.id
         async with DatabaseSession.get_session_context() as session:
             repo = ScraperLogRepository(session)
             stats = await repo.get_statistics()
 
         if not stats["last_run"]:
-            await message.answer("Парсер ещё не запускался.")
+            await message.answer("Парсер ещё не запускался.", reply_markup=self._back_kb("main"))
             return
 
         last_run = stats["last_run"]
@@ -770,10 +1315,10 @@ class ApartmentBot:
                 f"Запусков: {s['total_runs']} | Ошибок подряд: {s['consecutive_failures']}"
             )
 
-        await message.answer(text, parse_mode="HTML", reply_markup=self._get_keyboard(uid))
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("main"))
 
-    async def cmd_stats(self, message: Message) -> None:
-        uid = message.from_user.id
+    async def cmd_stats(self, message: Message, user_id: Optional[int] = None) -> None:
+        uid = user_id or message.from_user.id
         async with DatabaseSession.get_session_context() as session:
             apt_repo = ApartmentRepository(session)
             log_repo = ScraperLogRepository(session)
@@ -798,10 +1343,13 @@ class ApartmentBot:
             f"┣ ❌ Ошибок: {log_stats['failed_runs']}\n"
             f"┗ 📈 Успешность: {log_stats['success_rate']}%"
         )
-        await message.answer(text, parse_mode="HTML", reply_markup=self._get_keyboard(uid))
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("apartments"))
 
     async def cmd_search(self, message: Message) -> None:
         query = message.text.replace("/search", "").strip()
+        await self._render_search(message, query)
+
+    async def _render_search(self, message: Message, query: str) -> None:
         if not query:
             await message.answer("🔍 Укажите запрос. Пример: /search Сан Винсент")
             return
@@ -811,20 +1359,22 @@ class ApartmentBot:
             results = await repo.search(query)
 
         if not results:
-            await message.answer(f"🔍 По запросу '{query}' ничего не найдено.")
+            await message.answer(f"🔍 По запросу '{query}' ничего не найдено.",
+                                 reply_markup=self._back_kb("apartments"))
             return
 
         lines = [f"<b>🔍 Результаты: {query}</b>\n"]
         for apt in results:
             icon = "🟢" if apt.free_apartments and apt.free_apartments > 0 else "🔴"
             lines.append(f"{icon} {apt.name} — {apt.free_apartments or 0}/{apt.total_apartments or 0}")
-        await message.answer("\n".join(lines), parse_mode="HTML")
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("apartments"))
 
-    async def cmd_scrape(self, message: Message) -> None:
-        if not self._is_admin(message.from_user.id):
+    async def cmd_scrape(self, message: Message, user_id: Optional[int] = None) -> None:
+        if not self._is_admin(user_id or message.from_user.id):
             return
         if not self.scheduler:
-            await message.answer("❌ Парсер не запущен.")
+            await message.answer("❌ Парсер не запущен.", reply_markup=self._back_kb("admin"))
             return
         await message.answer("🔄 Запуск парсера...")
         try:
@@ -836,8 +1386,8 @@ class ApartmentBot:
         except Exception as e:
             await message.answer(f"❌ {e}")
 
-    async def cmd_crash_status(self, message: Message) -> None:
-        if not self._is_admin(message.from_user.id):
+    async def cmd_crash_status(self, message: Message, user_id: Optional[int] = None) -> None:
+        if not self._is_admin(user_id or message.from_user.id):
             return
         from app.scraper.crash_detector import get_crash_detector
         detector = get_crash_detector()
@@ -853,24 +1403,26 @@ class ApartmentBot:
             text += "\n<b>История:</b>\n"
             for e in stats["crash_history"]:
                 text += f"• {e['time']}: {e['free_change']} ({e['change_pct']})\n"
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("admin"))
 
-    async def cmd_crash_on(self, message: Message) -> None:
-        if not self._is_admin(message.from_user.id):
+    async def cmd_crash_on(self, message: Message, user_id: Optional[int] = None) -> None:
+        if not self._is_admin(user_id or message.from_user.id):
             return
         from app.scraper.crash_detector import get_crash_detector
         await get_crash_detector().set_enabled(True)
-        await message.answer("✅ Краш-детектор <b>включён</b>", parse_mode="HTML")
+        await message.answer("✅ Краш-детектор <b>включён</b>", parse_mode="HTML",
+                             reply_markup=self._back_kb("admin"))
 
-    async def cmd_crash_off(self, message: Message) -> None:
-        if not self._is_admin(message.from_user.id):
+    async def cmd_crash_off(self, message: Message, user_id: Optional[int] = None) -> None:
+        if not self._is_admin(user_id or message.from_user.id):
             return
         from app.scraper.crash_detector import get_crash_detector
         await get_crash_detector().set_enabled(False)
-        await message.answer("🔴 Краш-детектор <b>выключен</b>", parse_mode="HTML")
+        await message.answer("🔴 Краш-детектор <b>выключен</b>", parse_mode="HTML",
+                             reply_markup=self._back_kb("admin"))
 
-    async def cmd_crashday(self, message: Message) -> None:
-        uid = message.from_user.id
+    async def cmd_crashday(self, message: Message, user_id: Optional[int] = None) -> None:
+        uid = user_id or message.from_user.id
         from datetime import datetime, timezone
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         async with DatabaseSession.get_session_context() as session:
@@ -879,7 +1431,8 @@ class ApartmentBot:
             records = await repo.get_by_date(today)
 
         if not records:
-            await message.answer("📉 Слётов за сегодня не было.", parse_mode="HTML")
+            await message.answer("📉 Слётов за сегодня не было.", parse_mode="HTML",
+                                 reply_markup=self._back_kb("main"))
             return
 
         lines = [f"<b>📉 Слёты за {today}</b>\n"]
@@ -898,10 +1451,11 @@ class ApartmentBot:
             lines.append("")
 
         lines.append(f"┃ Всего освободилось квартир: {total}")
-        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=self._get_keyboard(uid))
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("main"))
 
-    async def cmd_map_check(self, message: Message) -> None:
-        if not self._is_admin(message.from_user.id):
+    async def cmd_map_check(self, message: Message, user_id: Optional[int] = None) -> None:
+        if not self._is_admin(user_id or message.from_user.id):
             return
         async with DatabaseSession.get_session_context() as session:
             from app.scraper.crash_detector import get_crash_detector
@@ -915,7 +1469,7 @@ class ApartmentBot:
             )
         else:
             text = "✅ Карта стабильна."
-        await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("admin"))
 
 
 async def send_notification(

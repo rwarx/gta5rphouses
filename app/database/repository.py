@@ -26,6 +26,7 @@ from app.database.models import (
     RealEstateEvent,
     RealEstateOwnerHistory,
     RealEstateBuildingState,
+    RealEstateSubscription,
 )
 
 
@@ -609,16 +610,22 @@ class RealEstateRepository:
         return result.scalar() or 0
 
     async def get_events_since(
-        self, since: datetime, event_types: Optional[List[str]] = None
+        self,
+        since: datetime,
+        event_types: Optional[List[str]] = None,
+        server_sid: Optional[str] = None,
     ) -> List[RealEstateEvent]:
-        """Return events detected at/after `since`, optionally filtered by type.
+        """Return events detected at/after `since`, optionally filtered.
 
-        Used by the hourly Payday digest to summarise what happened in the last
-        window instead of sending one message per event.
+        Used by the hourly Payday digest and the per-Payday report to summarise
+        what happened in a window instead of sending one message per event.
+        `server_sid` scopes the result to a single server.
         """
         conditions = [RealEstateEvent.detected_at >= since]
         if event_types:
             conditions.append(RealEstateEvent.event_type.in_(event_types))
+        if server_sid:
+            conditions.append(RealEstateEvent.server_sid == server_sid)
         result = await self.session.execute(
             select(RealEstateEvent)
             .where(and_(*conditions))
@@ -735,3 +742,82 @@ class RealEstateRepository:
             select(RealEstateObject).where(RealEstateObject.object_key == object_key)
         )
         return result.scalar_one_or_none()
+
+
+class SubscriptionRepository:
+    """
+    CRUD for per-user realestate notification subscriptions.
+
+    A subscription ties a Telegram user_id to a server sid (optionally narrowed
+    to a `kind`). The notifier uses `get_subscribers` to decide who receives a
+    freed-object alert for a given server.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def subscribe(
+        self, user_id: int, server_sid: str, kind: str = "any"
+    ) -> RealEstateSubscription:
+        """Create or update a user's subscription to a server (idempotent)."""
+        result = await self.session.execute(
+            select(RealEstateSubscription).where(
+                and_(
+                    RealEstateSubscription.user_id == user_id,
+                    RealEstateSubscription.server_sid == server_sid,
+                )
+            )
+        )
+        sub = result.scalar_one_or_none()
+        if sub:
+            sub.kind = kind
+        else:
+            sub = RealEstateSubscription(
+                user_id=user_id, server_sid=server_sid, kind=kind
+            )
+            self.session.add(sub)
+        await self.session.flush()
+        return sub
+
+    async def unsubscribe(self, user_id: int, server_sid: str) -> bool:
+        """Remove a user's subscription to a server. Returns True if one existed."""
+        result = await self.session.execute(
+            delete(RealEstateSubscription).where(
+                and_(
+                    RealEstateSubscription.user_id == user_id,
+                    RealEstateSubscription.server_sid == server_sid,
+                )
+            )
+        )
+        await self.session.flush()
+        return (result.rowcount or 0) > 0
+
+    async def list_for_user(self, user_id: int) -> List[RealEstateSubscription]:
+        """Return all of a user's subscriptions."""
+        result = await self.session.execute(
+            select(RealEstateSubscription)
+            .where(RealEstateSubscription.user_id == user_id)
+            .order_by(RealEstateSubscription.server_sid)
+        )
+        return list(result.scalars().all())
+
+    async def get_subscribers(
+        self, server_sid: str, kind: Optional[str] = None
+    ) -> List[RealEstateSubscription]:
+        """Return subscriptions for a server, optionally matching a kind.
+
+        A subscription with kind "any" matches every kind; a kind-specific
+        subscription matches only its own kind.
+        """
+        conditions = [RealEstateSubscription.server_sid == server_sid]
+        if kind:
+            conditions.append(
+                or_(
+                    RealEstateSubscription.kind == "any",
+                    RealEstateSubscription.kind == kind,
+                )
+            )
+        result = await self.session.execute(
+            select(RealEstateSubscription).where(and_(*conditions))
+        )
+        return list(result.scalars().all())

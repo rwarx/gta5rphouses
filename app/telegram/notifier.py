@@ -17,7 +17,9 @@ from app.database.repository import (
     NotificationRepository,
     ScraperSettingsRepository,
     RealEstateRepository,
+    SubscriptionRepository,
 )
+from app.scraper.realestate_client import sid_to_server_name, server_name_to_sid
 from app.telegram.bot import send_notification
 
 
@@ -34,6 +36,36 @@ class ChangeNotifier:
         # UTC hour (YYYY-MM-DD-HH) for which the hourly report was last sent, so
         # we emit exactly one report per clock hour.
         self._last_report_hour: Optional[str] = None
+        # UTC time this notifier started; the per-Payday report only considers
+        # events at/after this, so a restart never re-reports an old Payday.
+        self._started_at: Optional[datetime] = None
+
+    async def _recipients_for_server(
+        self, session, server_sid: Optional[str], kind: Optional[str] = None
+    ) -> List[int]:
+        """Resolve who should receive an alert for a server.
+
+        Users subscribed to the server (and matching kind) get it; if the server
+        has no subscribers we fall back to the globally allowed users so alerts
+        are never silently dropped. When no sid is known we also fall back.
+        """
+        allowed = list(self.settings.telegram.allowed_users)
+        if not server_sid:
+            return allowed
+
+        sub_repo = SubscriptionRepository(session)
+        subs = await sub_repo.get_subscribers(server_sid, kind=kind)
+        subscriber_ids = [s.user_id for s in subs]
+        if subscriber_ids:
+            # De-duplicate while preserving order.
+            seen = set()
+            unique = []
+            for uid in subscriber_ids:
+                if uid not in seen:
+                    seen.add(uid)
+                    unique.append(uid)
+            return unique
+        return allowed
 
     async def start(self) -> None:
         """Start the notification monitoring loop."""
@@ -42,12 +74,14 @@ class ChangeNotifier:
             return
 
         self._running = True
+        self._started_at = datetime.now(timezone.utc)
         logger.info("Change notifier started")
 
         while self._running:
             try:
                 await self._process_pending_notifications()
                 await self._maybe_send_hourly_report()
+                await self._maybe_send_payday_report()
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Notification loop error: {e}")
@@ -86,20 +120,41 @@ class ChangeNotifier:
             since = now - timedelta(hours=1)
             events = await realestate_repo.get_events_since(since)
 
-        self._last_report_hour = hour_key
-        message = self._build_hourly_report(events, since, now)
-        for user_id in self.settings.telegram.allowed_users:
-            await send_notification(self.bot, user_id, message)
+            # Group the hour's events by server so each server's subscribers get
+            # a report scoped to their server. Servers with no events this hour
+            # still get a short "no changes" report if someone is subscribed.
+            monitored = self.settings.realestate.server_names
+            monitored_sids = [
+                sid for sid in (
+                    server_name_to_sid(n) for n in monitored
+                ) if sid
+            ]
+            by_server: dict = {sid: [] for sid in monitored_sids}
+            for e in events:
+                by_server.setdefault(e.server_sid, []).append(e)
 
-    def _build_hourly_report(self, events, since, now) -> str:
+            self._last_report_hour = hour_key
+            for sid, server_events in by_server.items():
+                recipients = await self._recipients_for_server(session, sid)
+                if not recipients:
+                    continue
+                message = self._build_hourly_report(server_events, since, now, sid)
+                for user_id in recipients:
+                    await send_notification(self.bot, user_id, message)
+
+    def _build_hourly_report(self, events, since, now, server_sid=None) -> str:
         """Render the last hour of catalog events as one compact report."""
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
         possibly = [e for e in events if e.event_type == "possibly_freed"]
 
         period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
+        server = sid_to_server_name(server_sid) if server_sid else None
+        header = "🕐 <b>Почасовой отчёт (пейдей)</b>"
+        if server:
+            header = f"🕐 <b>Почасовой отчёт (пейдей) — {server}</b>"
         lines = [
-            "🕐 <b>Почасовой отчёт (пейдей)</b>",
+            header,
             f"<i>{period}</i>",
             "━━━━━━━━━━━━━━━",
             f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
@@ -121,6 +176,153 @@ class ChangeNotifier:
                 lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
             if len(possibly) > 10:
                 lines.append(f"…и ещё {len(possibly) - 10}")
+
+        return "\n".join(lines)
+
+    async def _maybe_send_payday_report(self) -> None:
+        """Emit one report per server per Payday map update.
+
+        Each time the wiki recomputes the catalog (a "map update", which is when
+        Payday churn settles) the realestate scheduler bumps the persisted
+        `catalog_recompute:<sid>` marker. When that marker advances past the one
+        we last reported on, we summarise everything that freed this Payday —
+        houses *and* apartments — and send it to that server's gov-notification
+        recipients. If nothing freed, we still send a short "<date>: за этот
+        пейдей ничего не слетело" so subscribers know the update was processed.
+
+        Gated behind the `payday_report` setting (on by default). The catalog's
+        fetchedAtMs only advances when the wiki recomputes (around Payday), so
+        firing on each advance is effectively one report per Payday.
+        """
+        async with DatabaseSession.get_session_context() as session:
+            settings_repo = ScraperSettingsRepository(session)
+            enabled = await settings_repo.get("payday_report")
+            if enabled is None:
+                await settings_repo.set("payday_report", "1")
+                enabled = "1"
+            if enabled != "1":
+                return
+
+            # Only report on freed-object notifications when gov-notifications
+            # are on; the map-update marker is still latched below regardless.
+            gov_on = await settings_repo.get("notify_free_found")
+            if gov_on is None:
+                await settings_repo.set("notify_free_found", "1")
+                gov_on = "1"
+
+            realestate_repo = RealEstateRepository(session)
+            monitored = self.settings.realestate.server_names
+            monitored_sids = [
+                sid for sid in (server_name_to_sid(n) for n in monitored) if sid
+            ]
+
+            for sid in monitored_sids:
+                marker = await settings_repo.get(f"catalog_recompute:{sid}")
+                if marker is None:
+                    continue  # scheduler hasn't diffed this server yet
+
+                reported_key = f"payday_report_marker:{sid}"
+                since_key = f"payday_report_at:{sid}"
+                last_reported = await settings_repo.get(reported_key)
+                if last_reported == marker:
+                    continue  # already reported this recompute
+
+                now = datetime.now(timezone.utc)
+                # Window to summarise: everything freed since the previous report
+                # (or since startup on the first run), so consecutive Paydays
+                # never double-count each other's freed objects.
+                prev_at = await settings_repo.get(since_key)
+                if prev_at:
+                    try:
+                        since = datetime.fromisoformat(prev_at)
+                    except ValueError:
+                        since = self._started_at or (now - timedelta(hours=6))
+                else:
+                    since = self._started_at or (now - timedelta(hours=6))
+
+                # detected_at is stored as naive, whole-second UTC (func.now()),
+                # while a bound param renders with sub-second precision — so an
+                # exact boundary drops events landing in the same second. Drop
+                # the tz and back off one second; the overlap is harmless given
+                # a Payday window spans minutes.
+                since = since.replace(tzinfo=None) - timedelta(seconds=1)
+
+                # Latch marker + window first so a delivery failure can't spam
+                # the report on the next 5s loop iteration. Floor to whole
+                # seconds: detected_at (func.now()) has no sub-second precision,
+                # so a microsecond-precise boundary would drop same-second events.
+                await settings_repo.set(reported_key, marker)
+                await settings_repo.set(
+                    since_key, now.replace(microsecond=0).isoformat()
+                )
+
+                if last_reported is None:
+                    # First time we see this server (e.g. right after startup):
+                    # adopt the current marker without reporting a Payday we may
+                    # only have partially observed.
+                    continue
+
+                if gov_on != "1":
+                    continue
+
+                events = await realestate_repo.get_events_since(
+                    since, event_types=["freed"], server_sid=sid
+                )
+                recipients = await self._recipients_for_server(session, sid)
+                if not recipients:
+                    continue
+
+                message = self._build_payday_report(events, sid)
+                for user_id in recipients:
+                    await send_notification(self.bot, user_id, message)
+
+    def _build_payday_report(self, events, server_sid=None) -> str:
+        """Render the freed houses + apartments of one Payday as a report.
+
+        `events` are the "freed" RealEstateEvents for this server since the last
+        report. When empty, returns the "nothing freed this Payday" message.
+        """
+        now = datetime.now(timezone.utc)
+        date = now.strftime("%d.%m.%Y")
+        server = sid_to_server_name(server_sid) if server_sid else None
+        suffix = f" — {server}" if server else ""
+
+        freed_houses = [e for e in events if e.kind == "house"]
+        freed_apts = [e for e in events if e.kind == "apartment"]
+
+        if not events:
+            return (
+                f"🏛 <b>Гос-отчёт за пейдей{suffix}</b>\n"
+                f"<i>{date}</i>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"✅ {date}: за этот пейдей ничего не слетело."
+            )
+
+        lines = [
+            f"🏛 <b>Гос-отчёт за пейдей{suffix}</b>",
+            f"<i>{date}</i>",
+            "━━━━━━━━━━━━━━━",
+            f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
+            f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>",
+        ]
+
+        def _fmt(e) -> str:
+            name = e.name or f"#{e.object_key.split(':')[-1]}"
+            extra = f" ({e.class_name})" if e.class_name else ""
+            if e.price:
+                extra += f" · 💰 {e.price:,}".replace(",", " ")
+            return f"• {name}{extra}"
+
+        if freed_houses:
+            lines.append("\n<b>🏠 Дома:</b>")
+            lines.extend(_fmt(e) for e in freed_houses[:20])
+            if len(freed_houses) > 20:
+                lines.append(f"…и ещё {len(freed_houses) - 20}")
+        if freed_apts:
+            lines.append("\n<b>🏢 Квартиры:</b>")
+            lines.extend(_fmt(e) for e in freed_apts[:20])
+            if len(freed_apts) > 20:
+                lines.append(f"…и ещё {len(freed_apts) - 20}")
 
         return "\n".join(lines)
 
@@ -203,7 +405,10 @@ class ChangeNotifier:
                     continue
 
                 message = self._build_realestate_message(event)
-                for user_id in self.settings.telegram.allowed_users:
+                recipients = await self._recipients_for_server(
+                    session, event.server_sid, kind=event.kind
+                )
+                for user_id in recipients:
                     await send_notification(self.bot, user_id, message)
 
                 await realestate_repo.mark_event_notified(event.id)
@@ -218,9 +423,12 @@ class ChangeNotifier:
         name = event.name or f"{kind_ru} #{event.object_key.split(':')[-1]}"
 
         parts: List[str] = []
+        server = sid_to_server_name(event.server_sid) if event.server_sid else None
         if event.event_type == "freed":
             parts.append(f"🎉 <b>Освободилось: {kind_ru.lower()}!</b>")
             parts.append("━━━━━━━━━━━━━━━")
+            if server:
+                parts.append(f"🌐 Сервер: {server}")
             parts.append(f"🏠 {name}")
             if event.class_name:
                 parts.append(f"🏷 Класс: {event.class_name}")

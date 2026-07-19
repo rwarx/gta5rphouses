@@ -49,6 +49,31 @@ def server_name_to_sid(name: str) -> Optional[str]:
     return None
 
 
+def sid_to_server_name(sid: str) -> Optional[str]:
+    """Map a zero-padded sid back to its display name, e.g. '20' -> 'Murrieta'."""
+    try:
+        idx = int(sid) - 1
+    except (TypeError, ValueError):
+        return None
+    if 0 <= idx < len(SERVER_ORDER):
+        return SERVER_ORDER[idx]
+    return None
+
+
+def resolve_servers(names: List[str]) -> Dict[str, str]:
+    """Resolve display names to a {sid: name} map, dropping any unknown names.
+
+    Order-preserving and de-duplicated by sid. Used to turn a configured server
+    list into the sids the scheduler polls.
+    """
+    resolved: Dict[str, str] = {}
+    for name in names:
+        sid = server_name_to_sid(name)
+        if sid and sid not in resolved:
+            resolved[sid] = SERVER_ORDER[int(sid) - 1]
+    return resolved
+
+
 @dataclass
 class RealEstateUnit:
     """A single apartment or house entry from the catalog (an occupied object)."""
@@ -143,6 +168,27 @@ class RealEstateClient:
         logger.info(f"Resolved realestate action hash: {action_hash}")
         return action_hash
 
+    async def _fetch_payload(self, server_sid: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the raw catalog dict for a server, transparently re-resolving the
+        Server Action hash once if it has rotated (site redeploy). Returns the
+        parsed catalog dict, or None if it could not be fetched.
+        """
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            # Resolve (and cache) the action hash; re-resolve on failure.
+            if not self._action_hash:
+                self._action_hash = await self._resolve_action_hash(session)
+
+            payload = await self._call_action(session, self._action_hash, server_sid)
+
+            # Hash may have rotated on redeploy — retry once with a fresh one.
+            if payload is None:
+                logger.warning("Action call failed, re-resolving hash and retrying")
+                self._action_hash = await self._resolve_action_hash(session)
+                payload = await self._call_action(session, self._action_hash, server_sid)
+
+            return payload
+
     async def fetch_snapshot(self, server_sid: str) -> Optional[RealEstateSnapshot]:
         """
         Fetch the full real-estate catalog for a server.
@@ -154,31 +200,35 @@ class RealEstateClient:
             RealEstateSnapshot on success, None on failure.
         """
         try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                # Resolve (and cache) the action hash; re-resolve on failure.
-                if not self._action_hash:
-                    self._action_hash = await self._resolve_action_hash(session)
-
-                payload = await self._call_action(
-                    session, self._action_hash, server_sid
-                )
-
-                # Hash may have rotated on redeploy — retry once with a fresh one.
-                if payload is None:
-                    logger.warning("Action call failed, re-resolving hash and retrying")
-                    self._action_hash = await self._resolve_action_hash(session)
-                    payload = await self._call_action(
-                        session, self._action_hash, server_sid
-                    )
-
-                if payload is None:
-                    logger.error("Failed to fetch realestate data after retry")
-                    return None
-
-                return self._parse_payload(payload, server_sid)
-
+            payload = await self._fetch_payload(server_sid)
+            if payload is None:
+                logger.error("Failed to fetch realestate data after retry")
+                return None
+            return self._parse_payload(payload, server_sid)
         except Exception as e:
             logger.error(f"RealEstate fetch failed: {e}")
+            return None
+
+    async def fetch_updated_ms(self, server_sid: str) -> Optional[int]:
+        """
+        Fetch only the catalog's data-refresh marker (`fetchedAtMs`).
+
+        This is the same value the map shows as "Обновлено": a server-side
+        "data last refreshed at" timestamp (epoch ms) that stays constant until
+        the wiki recomputes the catalog (which happens around Payday). It lets
+        callers cheaply gate expensive work — a browser scrape, a full DB diff —
+        on whether the data actually moved, instead of polling on a blind timer.
+
+        Note: the endpoint returns the whole catalog (~80 KB gzip) with no-cache
+        and no ETag, so the value cannot be read any cheaper than one fetch; we
+        just skip parsing the 1000+ objects. Returns the marker, or None on
+        failure.
+        """
+        try:
+            payload = await self._fetch_payload(server_sid)
+            return payload.get("fetchedAtMs") if payload else None
+        except Exception as e:
+            logger.error(f"RealEstate updated-ms fetch failed: {e}")
             return None
 
     async def _call_action(

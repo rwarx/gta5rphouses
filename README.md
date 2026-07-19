@@ -121,6 +121,12 @@ HIGH_INTERVAL=5           # 5 секунд в Payday окно
 PAYDAY_START_MINUTE=56    # Начало Payday (минута часа)
 PAYDAY_END_MINUTE=1       # Конец Payday (минута следующего часа)
 
+# Гейт по обновлению карты: запускать браузерный скрап только когда каталог
+# /realestate сообщает о новых данных (метка «Обновлено»/fetchedAtMs сдвинулась),
+# а не по слепому таймеру. Экономит ресурсы в Payday. Fail-open: при ошибке
+# чтения метки скрап всё равно выполняется, чтобы не пропустить обновление.
+MAP_UPDATE_GATE=true
+
 # Источник /realestate (каталог сервера)
 REALESTATE_ENABLED=false        # Включить опрос каталога /realestate
 REALESTATE_SERVER=Murrieta      # Имя сервера

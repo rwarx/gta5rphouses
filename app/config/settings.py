@@ -68,6 +68,12 @@ class ScraperSettings:
     check_interval: int = int(env("CHECK_INTERVAL", "60"))
     use_proxy: bool = env("USE_PROXY", "false").lower() == "true"
     proxy: Optional[str] = env("PROXY") or None
+    # Gate the (expensive) browser scrape on the catalog's data-refresh marker:
+    # only launch Playwright when the `/realestate` catalog reports new data
+    # (`fetchedAtMs` advanced), instead of scraping on a blind timer. Requires a
+    # resolvable REALESTATE_SERVER. Fails open (scrapes) if the marker can't be
+    # read, so a source hiccup never causes a missed update.
+    map_update_gate: bool = env("MAP_UPDATE_GATE", "true").lower() == "true"
 
 
 class SmartModeSettings:
@@ -135,7 +141,13 @@ class RealEstateSettings:
     # Enable the realestate HTTP source (independent of the map scraper).
     enabled: bool = env("REALESTATE_ENABLED", "false").lower() == "true"
     # Human-readable server name; mapped to its sid via SERVER_ORDER.
+    # Kept as the "primary" server (used by the map-update gate and as the
+    # default target for catalog commands that omit a server argument).
     server_name: str = env("REALESTATE_SERVER", "Murrieta")
+    # Comma-separated list of servers to monitor, e.g. "Murrieta,Strawberry".
+    # Falls back to the single REALESTATE_SERVER when unset, so existing configs
+    # keep working. Each server is polled and diffed independently every tick.
+    _servers_raw: str = env("REALESTATE_SERVERS", "")
     # Seconds between catalog fetches.
     interval: int = int(env("REALESTATE_INTERVAL", "300"))
     # Notify on newly freed objects (an occupied unit disappearing from the catalog).
@@ -147,6 +159,20 @@ class RealEstateSettings:
 
     def __init__(self):
         assert self.interval >= 5, "REALESTATE_INTERVAL must be >= 5"
+
+    @property
+    def server_names(self) -> list:
+        """Servers to monitor, de-duplicated and order-preserving.
+
+        Reads REALESTATE_SERVERS (comma list) and falls back to the single
+        REALESTATE_SERVER. The primary `server_name` is always included first.
+        """
+        names = []
+        for raw in [self.server_name, *self._servers_raw.split(",")]:
+            name = raw.strip()
+            if name and name.lower() not in {n.lower() for n in names}:
+                names.append(name)
+        return names
 
 
 class Settings:

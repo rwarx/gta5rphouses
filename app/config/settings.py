@@ -35,6 +35,12 @@ class DatabaseSettings:
     def __init__(self):
         _root = Path(__file__).resolve().parent.parent.parent
 
+        # Env values can arrive with stray whitespace/newlines (e.g. Railway
+        # reference variables); strip them or the URL fails to parse.
+        self.database_url = self.database_url.strip()
+        self.database_sync_url = self.database_sync_url.strip()
+        self.redis_url = self.redis_url.strip()
+
         # Railway provides postgresql:// but we need postgresql+asyncpg://
         if self.database_url.startswith("postgresql://") and "+" not in self.database_url.split("://")[0]:
             self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)

@@ -170,3 +170,57 @@ def test_selsrv_callback_parses_sid():
 
 def test_map_server_setting_defaults_to_murrieta(bot):
     assert bot.settings.scraper.map_server == "Murrieta"
+
+
+# ---- 🏠 Квартиры reads the per-server catalog (follows the picked server) ----
+
+@pytest.mark.asyncio
+async def test_apartments_list_uses_selected_server_catalog(session, monkeypatch):
+    """cmd_list must render buildings from the user's selected server, not a
+    global/hard-coded Murrieta source."""
+    from app.database.repository import RealEstateRepository
+    from app.telegram import bot as bot_mod
+
+    # Seed catalog buildings for two servers: Davis (05) and Murrieta (20).
+    repo = RealEstateRepository(session)
+    await repo.upsert_building("05:building:1", {
+        "server_sid": "05", "building_id": 1, "name": "Davis Tower",
+        "apartments_count": 10, "free_count": 3,
+    })
+    await repo.upsert_building("20:building:1", {
+        "server_sid": "20", "building_id": 1, "name": "Murrieta Tower",
+        "apartments_count": 8, "free_count": 0,
+    })
+
+    # Route the bot's DB access to this in-memory session.
+    class _Ctx:
+        async def __aenter__(self_inner):
+            return session
+        async def __aexit__(self_inner, *a):
+            return False
+    monkeypatch.setattr(bot_mod.DatabaseSession, "get_session_context", lambda: _Ctx())
+
+    b = ApartmentBot()
+
+    # User picked Davis (sid 05).
+    async def fake_default(uid):
+        return "05", "Davis"
+    monkeypatch.setattr(b, "_default_sid_for_user", fake_default)
+
+    captured = {}
+
+    async def fake_chunked(message, lines, header, footer_kb=None):
+        captured["lines"] = lines
+        captured["header"] = header
+    monkeypatch.setattr(b, "_reply_chunked", fake_chunked)
+
+    class _Msg:
+        from_user = type("U", (), {"id": 1})()
+        async def answer(self, *a, **k):
+            captured["answer"] = a
+    await b.cmd_list(_Msg(), user_id=1)
+
+    blob = (captured.get("header", "") + "\n".join(captured.get("lines", [])))
+    assert "Davis" in blob
+    assert "Davis Tower" in blob
+    assert "Murrieta Tower" not in blob  # the other server must not leak in

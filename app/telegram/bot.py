@@ -38,6 +38,7 @@ from app.database.repository import (
     ChangeRepository,
     ScraperLogRepository,
     ApartmentHistoryRepository,
+    RealEstateRepository,
 )
 from app.scraper.scheduler import SmartScheduler
 
@@ -177,7 +178,7 @@ class ApartmentBot:
         ),
         "apartments": (
             "<b>🏠 Квартиры</b>\n"
-            "Списки, статус и поиск по зданиям Murrieta."
+            "Списки, статус и поиск по зданиям выбранного сервера."
         ),
         "catalog": (
             "<b>🏢 Каталог владельцев</b>\n"
@@ -1246,33 +1247,41 @@ class ApartmentBot:
         await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("main"))
 
     async def cmd_list(self, message: Message, user_id: Optional[int] = None) -> None:
-        uid = user_id or message.from_user.id
-        async with DatabaseSession.get_session_context() as session:
-            repo = ApartmentRepository(session)
-            apartments = await repo.get_all()
-            stats = await repo.get_statistics()
+        """List apartment buildings (free/total) for the user's selected server.
 
-        if not apartments:
-            await message.answer("🏠 Нет данных о квартирах.", reply_markup=self._back_kb("apartments"))
+        Sourced from the per-server `/realestate` catalog, so the list follows
+        whichever server the user picked at /start — not the single map server.
+        """
+        uid = user_id or message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid)
+
+        if not buildings:
+            await message.answer(
+                f"🏠 Нет данных о квартирах для сервера {server_name}. "
+                "Дождитесь первого сканирования каталога.",
+                reply_markup=self._back_kb("apartments"),
+            )
             return
 
-        free_count = sum(1 for a in apartments if a.free_apartments and a.free_apartments > 0)
-        total_count = len(apartments)
+        total_free = sum((b.free_count or 0) for b in buildings)
+        total_units = sum((b.apartments_count or 0) for b in buildings)
+        total_occupied = max(total_units - total_free, 0)
+        free_count = sum(1 for b in buildings if b.free_count and b.free_count > 0)
+        total_count = len(buildings)
         lines = [
-            "<b>🏠 Все квартиры · Murrieta</b>\n",
-            f"🟢 Свободно: {stats['total_free']} | 🔴 Занято: {stats['total_occupied']} | 📦 Всего: {stats['total_units']}\n",
+            f"<b>🏠 Все квартиры · {server_name}</b>\n",
+            f"🟢 Свободно: {total_free} | 🔴 Занято: {total_occupied} | 📦 Всего: {total_units}\n",
             f"┃ 🏠 Зданий со свободными: {free_count}/{total_count}\n",
         ]
-        for i, apt in enumerate(apartments, 1):
-            if apt.free_apartments and apt.free_apartments > 0:
-                icon = "🟢"
-                status = "свободно"
-            else:
-                icon = "🔴"
-                status = "занято"
-            free = apt.free_apartments or 0
-            total = apt.total_apartments or 0
-            lines.append(f"{icon} {i:02d}. {apt.name} — {status} | {free}/{total}")
+        for i, b in enumerate(buildings, 1):
+            free = b.free_count or 0
+            total = b.apartments_count or 0
+            icon = "🟢" if free > 0 else "🔴"
+            status = "свободно" if free > 0 else "занято"
+            lines.append(f"{icon} {i:02d}. {b.name} — {status} | {free}/{total}")
 
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("apartments"))
@@ -1283,77 +1292,103 @@ class ApartmentBot:
 
     async def _render_status(self, message: Message, args: str) -> None:
         if not args:
-            await message.answer("Укажите ID или название. Пример: /status 1")
+            await message.answer("Укажите название здания. Пример: /status Eclipse Towers")
             return
+
+        # Resolve a building in the per-server catalog for the user's active
+        # server (partial name match), so status follows the picked server
+        # instead of the global map-scraper table.
+        from app.database.repository import RealEstateRepository
+        uid = message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
 
         async with DatabaseSession.get_session_context() as session:
-            repo = ApartmentRepository(session)
-            try:
-                apt_id = int(args)
-                apartment = await repo.get_with_types(apt_id)
-            except ValueError:
-                results = await repo.search(args)
-                apartment = results[0] if results else None
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid) if sid else []
 
-        if not apartment:
-            await message.answer(f"Квартира '{args}' не найдена.",
-                                 reply_markup=self._back_kb("apartments"))
+        q = args.lower()
+        building = next((b for b in buildings if q in (b.name or "").lower()), None)
+
+        if not building:
+            await message.answer(
+                f"🏢 Здание «{args}» не найдено на сервере {server_name} "
+                f"(список: /buildings).",
+                reply_markup=self._back_kb("apartments"),
+            )
             return
 
-        free = apartment.free_apartments or 0
-        total = apartment.total_apartments or 0
-        occupied = apartment.occupied_apartments or 0
+        free = building.free_count or 0
+        total = building.apartments_count if building.apartments_count is not None else 0
+        occupied = max(total - free, 0)
         bar_len = 12
         free_blocks = round(free / max(total, 1) * bar_len) if total > 0 else 0
         bar = "🟩" * free_blocks + "⬛" * (bar_len - free_blocks)
 
         text = (
-            f"<b>🏠 {apartment.name}</b>\n"
-            f"┣ 📍 {apartment.address or '—'}\n"
+            f"<b>🏢 {building.name} · {server_name}</b>\n"
             f"┣ {bar}\n"
             f"┣ 🟢 Свободно: {free}  |  🔴 Занято: {occupied}\n"
-            f"┗ 📊 Всего: {total}\n"
+            f"┗ 📊 Всего: {total}\n\n"
+            f"<i>Владельцы занятых квартир: /building {building.name}</i>"
         )
-
-        if apartment.apartment_types:
-            for t in apartment.apartment_types:
-                icon = "🟢" if t.free and t.free > 0 else "🔴"
-                text += f"\n{icon} {t.class_name}: {t.free or 0} св. / {t.occupied or 0} зан."
-
-        if apartment.last_updated:
-            text += f"\n\n🕐 {apartment.last_updated.strftime('%d.%m.%Y %H:%M:%S')}"
+        if building.updated_at:
+            text += f"\n🕐 {building.updated_at.strftime('%d.%m.%Y %H:%M:%S')}"
 
         await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("apartments"))
 
     async def cmd_free(self, message: Message, user_id: Optional[int] = None) -> None:
-        async with DatabaseSession.get_session_context() as session:
-            repo = ApartmentRepository(session)
-            free_apts = await repo.get_free_apartments()
-            stats = await repo.get_statistics()
+        """Buildings with free apartments, on the user's selected server."""
+        uid = user_id or message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+        from app.database.repository import RealEstateRepository
 
-        if not free_apts:
-            await message.answer("😢 Нет свободных квартир.", reply_markup=self._back_kb("apartments"))
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid)
+
+        free_bld = [b for b in buildings if (b.free_count or 0) > 0]
+        if not free_bld:
+            await message.answer(
+                f"😢 На сервере {server_name} нет зданий со свободными квартирами."
+                if buildings else
+                f"🏢 Данных по {server_name} пока нет. Дождитесь первого сканирования.",
+                reply_markup=self._back_kb("apartments"),
+            )
             return
 
-        lines = [f"<b>🟢 Свободно: {stats['total_free']}/{stats['total_units']}</b>\n"]
-        for i, apt in enumerate(free_apts, 1):
-            lines.append(f"{i:02d}. <b>{apt.name}</b> — свободно {apt.free_apartments}")
+        total_free = sum(b.free_count or 0 for b in free_bld)
+        lines = [f"<b>🟢 Свободные квартиры · {server_name}</b>\nВсего свободно: {total_free}\n"]
+        for i, b in enumerate(sorted(free_bld, key=lambda x: -(x.free_count or 0)), 1):
+            total = b.apartments_count if b.apartments_count is not None else "?"
+            lines.append(f"🟢 {i:02d}. <b>{b.name}</b> — свободно {b.free_count}/{total}")
+        lines.append("\n<i>Владельцы занятых: /building &lt;название&gt;</i>")
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("apartments"))
 
     async def cmd_occupied(self, message: Message, user_id: Optional[int] = None) -> None:
-        async with DatabaseSession.get_session_context() as session:
-            repo = ApartmentRepository(session)
-            apartments = await repo.get_all()
+        """Fully-occupied buildings (no free apartments) on the selected server."""
+        uid = user_id or message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+        from app.database.repository import RealEstateRepository
 
-        occupied = [a for a in apartments if a.free_apartments == 0 and a.total_apartments and a.total_apartments > 0]
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid)
+
+        occupied = [b for b in buildings if (b.free_count or 0) == 0 and (b.apartments_count or 0) > 0]
         if not occupied:
-            await message.answer("🎉 Все квартиры свободны!", reply_markup=self._back_kb("apartments"))
+            await message.answer(
+                f"🎉 На сервере {server_name} везде есть свободные квартиры!"
+                if buildings else
+                f"🏢 Данных по {server_name} пока нет. Дождитесь первого сканирования.",
+                reply_markup=self._back_kb("apartments"),
+            )
             return
 
-        lines = ["<b>🔴 Полностью занятые</b>\n"]
-        for i, apt in enumerate(occupied, 1):
-            lines.append(f"{i:02d}. {apt.name} — {apt.total_apartments}/{apt.total_apartments}")
+        lines = [f"<b>🔴 Полностью занятые · {server_name}</b>\n"]
+        for i, b in enumerate(sorted(occupied, key=lambda x: x.name or ""), 1):
+            total = b.apartments_count or 0
+            lines.append(f"🔴 {i:02d}. {b.name} — {total}/{total}")
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("apartments"))
 
@@ -1437,25 +1472,48 @@ class ApartmentBot:
         await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("main"))
 
     async def cmd_stats(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Apartment statistics for the user's active server (from the catalog)."""
         uid = user_id or message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+
+        from app.database.repository import RealEstateRepository, ScraperLogRepository
         async with DatabaseSession.get_session_context() as session:
-            apt_repo = ApartmentRepository(session)
+            re_repo = RealEstateRepository(session)
+            buildings = await re_repo.get_buildings(sid)
+            occupied_houses = await re_repo.count_occupied(sid, kind="house")
             log_repo = ScraperLogRepository(session)
-            apt_stats = await apt_repo.get_statistics()
             log_stats = await log_repo.get_statistics()
 
+        # Apartment totals come from the per-building free/total counts; houses
+        # are counted from occupied catalog objects (the catalog lists only
+        # occupied ones, so "free houses" isn't derivable — we show occupied).
+        apt_total = sum((b.apartments_count or 0) for b in buildings)
+        apt_free = sum((b.free_count or 0) for b in buildings)
+        apt_occupied = apt_total - apt_free
+        buildings_with_free = sum(1 for b in buildings if (b.free_count or 0) > 0)
+
+        if not buildings and occupied_houses == 0:
+            await message.answer(
+                f"📊 <b>Статистика · {server_name}</b>\n"
+                "Данных пока нет — дождитесь первого сканирования этого сервера.",
+                parse_mode="HTML", reply_markup=self._back_kb("apartments"),
+            )
+            return
+
         bar_len = 10
-        free_pct = apt_stats["total_free"] / max(apt_stats["total_units"], 1)
+        free_pct = apt_free / max(apt_total, 1)
         occ_blocks = round((1 - free_pct) * bar_len)
         bar = "🟩" * (bar_len - occ_blocks) + "⬛" * occ_blocks
+        occupancy = round((1 - free_pct) * 100, 1)
 
         text = (
-            f"📊 <b>Статистика · Murrieta</b>\n"
+            f"📊 <b>Статистика · {server_name}</b>\n"
             f"┏━━━━━━━━━━━━━━━\n"
             f"┃ {bar}\n"
-            f"┃ 🟢 Свободно: {apt_stats['total_free']}  🔴 Занято: {apt_stats['total_occupied']}\n"
-            f"┃ 🏠 Зданий: {apt_stats['total_apartments']}  📦 Всего кв.: {apt_stats['total_units']}\n"
-            f"┃ 📈 Заполненность: {apt_stats['occupancy_rate']}%\n"
+            f"┃ 🏢 Квартиры: 🟢 {apt_free} своб.  🔴 {apt_occupied} зан.  📦 {apt_total} всего\n"
+            f"┃ 🏠 Зданий: {len(buildings)} (со свободными: {buildings_with_free})\n"
+            f"┃ 🏠 Занятых домов: {occupied_houses}\n"
+            f"┃ 📈 Заполненность квартир: {occupancy}%\n"
             f"┗━━━━━━━━━━━━━━━\n\n"
             f"<b>Парсер</b>\n"
             f"┣ ✅ Успешно: {log_stats['successful_runs']}\n"
@@ -1473,19 +1531,35 @@ class ApartmentBot:
             await message.answer("🔍 Укажите запрос. Пример: /search Сан Винсент")
             return
 
+        # Search the per-server catalog for the user's active server: match
+        # apartment buildings by name (with their live free/total counts). This
+        # replaces the old global map-scraper table so results follow the server
+        # the user picked at /start.
+        from app.database.repository import RealEstateRepository
+        uid = message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+
         async with DatabaseSession.get_session_context() as session:
-            repo = ApartmentRepository(session)
-            results = await repo.search(query)
+            repo = RealEstateRepository(session)
+            buildings = await repo.get_buildings(sid) if sid else []
+
+        q = query.lower()
+        results = [b for b in buildings if q in (b.name or "").lower()]
 
         if not results:
-            await message.answer(f"🔍 По запросу '{query}' ничего не найдено.",
-                                 reply_markup=self._back_kb("apartments"))
+            await message.answer(
+                f"🔍 По запросу «{query}» на сервере {server_name} ничего не найдено.",
+                reply_markup=self._back_kb("apartments"),
+            )
             return
 
-        lines = [f"<b>🔍 Результаты: {query}</b>\n"]
-        for apt in results:
-            icon = "🟢" if apt.free_apartments and apt.free_apartments > 0 else "🔴"
-            lines.append(f"{icon} {apt.name} — {apt.free_apartments or 0}/{apt.total_apartments or 0}")
+        lines = [f"<b>🔍 Результаты: {query} · {server_name}</b>\n"]
+        for b in results:
+            free = b.free_count or 0
+            total = b.apartments_count if b.apartments_count is not None else 0
+            icon = "🟢" if free > 0 else "🔴"
+            lines.append(f"{icon} {b.name} — свободно {free}/{total}")
+        lines.append("\n<i>Владельцы квартир: /building &lt;название&gt;</i>")
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("apartments"))
 

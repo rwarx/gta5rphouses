@@ -4,7 +4,8 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 
 # Async
-asyncio==3.4.3
+# NOTE: `asyncio` is a stdlib module — never pin it from PyPI (the package there
+# is an ancient backport that can shadow/break the real one).
 aiofiles==24.1.0
 
 # Web Scraping
@@ -18,8 +19,9 @@ asyncpg==0.30.0
 aiosqlite==0.22.1
 alembic==1.14.0
 psycopg2-binary==2.9.10
+# redis.asyncio ships inside redis>=4.2, so use that instead of the abandoned
+# `aioredis` (which is unmaintained and breaks on Python 3.12).
 redis==5.2.0
-aioredis==2.0.1
 
 # API
 fastapi==0.115.4

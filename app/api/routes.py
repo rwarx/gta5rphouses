@@ -6,9 +6,10 @@ Provides REST endpoints for frontend and external access.
 from typing import Optional, List
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database.session import get_db_session
 from app.database.repository import (
     ApartmentRepository,
@@ -21,6 +22,27 @@ from app.database.repository import (
 from app.database.models import Apartment
 
 router = APIRouter(prefix="/api/v1", tags=["apartments"])
+
+
+async def require_admin_token(
+    authorization: Optional[str] = Header(None),
+) -> None:
+    """Guard side-effecting endpoints with a bearer token.
+
+    If API_ADMIN_TOKEN is unset the endpoint is disabled entirely (503) rather
+    than left open — side-effecting routes must never be callable anonymously.
+    """
+    configured = get_settings().api.admin_token
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Endpoint disabled: set API_ADMIN_TOKEN to enable it.",
+        )
+    expected = f"Bearer {configured}"
+    # Constant-time compare to avoid leaking the token via timing.
+    import hmac
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing token.")
 
 
 # ============ Apartment endpoints ============
@@ -262,11 +284,16 @@ async def export_data(
 
 # ============ Health check ============
 
-@router.get("/scraper/trigger")
+@router.post("/scraper/trigger", dependencies=[Depends(require_admin_token)])
 async def trigger_scrape():
-    """Manually trigger a full apartment scrape."""
-    from app.scraper.scheduler import SmartScheduler
-    scheduler = SmartScheduler()
+    """Manually trigger a full apartment scrape (token-protected).
+
+    Uses the process-wide scheduler singleton so it reuses the running browser
+    lifecycle instead of spawning a second, unmanaged Playwright instance. This
+    is a POST (not GET) because it has side effects and must not be prefetched.
+    """
+    from app.scraper.scheduler import get_scheduler
+    scheduler = get_scheduler()
     try:
         result = await scheduler.force_scrape()
         return {

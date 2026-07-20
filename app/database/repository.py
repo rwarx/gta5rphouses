@@ -27,6 +27,7 @@ from app.database.models import (
     RealEstateOwnerHistory,
     RealEstateBuildingState,
     RealEstateSubscription,
+    UserServerSelection,
 )
 
 
@@ -821,3 +822,52 @@ class SubscriptionRepository:
             select(RealEstateSubscription).where(and_(*conditions))
         )
         return list(result.scalars().all())
+
+
+class UserServerSelectionRepository:
+    """
+    Read/write a user's active server (the one chosen at /start).
+
+    Exactly one row per user; `set` upserts. Catalog commands call `get` to
+    resolve the server to default to when none is given explicitly.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get(self, user_id: int) -> Optional[str]:
+        """Return the user's active server sid, or None if they never picked one."""
+        result = await self.session.execute(
+            select(UserServerSelection.server_sid).where(
+                UserServerSelection.user_id == user_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def set(self, user_id: int, server_sid: str) -> None:
+        """Set (upsert) the user's active server."""
+        result = await self.session.execute(
+            select(UserServerSelection).where(
+                UserServerSelection.user_id == user_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            row.server_sid = server_sid
+        else:
+            self.session.add(
+                UserServerSelection(user_id=user_id, server_sid=server_sid)
+            )
+        await self.session.flush()
+
+    async def all_selected_sids(self) -> List[str]:
+        """Distinct server sids any user has actively chosen at /start.
+
+        The scheduler unions these with the configured REALESTATE_SERVERS so a
+        server a user picked is polled (and its catalog/map populated) even if
+        it was never listed in the static config.
+        """
+        result = await self.session.execute(
+            select(UserServerSelection.server_sid).distinct()
+        )
+        return [sid for sid in result.scalars().all() if sid]

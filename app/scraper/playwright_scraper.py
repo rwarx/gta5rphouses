@@ -91,11 +91,12 @@ class ApartmentScraper:
                     break
                 await asyncio.sleep(1)
 
-            logger.info("Selecting server Murrieta...")
+            target_server = self.settings.scraper.map_server
+            logger.info(f"Selecting server {target_server}...")
             buttons = await page.query_selector_all("button.map-server-card")
             for b in buttons:
                 t = await b.inner_text()
-                if "Murrieta" in t:
+                if target_server.lower() in t.lower():
                     await b.click()
                     await asyncio.sleep(5)
                     break

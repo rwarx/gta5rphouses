@@ -20,7 +20,9 @@ from loguru import logger
 from app.config import get_settings
 from app.database.session import DatabaseSession
 from app.database.repository import ScraperLogRepository
-from app.scraper.realestate_client import RealEstateClient, resolve_servers
+from app.scraper.realestate_client import (
+    RealEstateClient, resolve_servers, sid_to_server_name,
+)
 from app.scraper.realestate_detector import RealEstateDetector
 
 
@@ -56,16 +58,19 @@ class RealEstateScheduler:
             logger.info("RealEstate source disabled (REALESTATE_ENABLED=false)")
             return
 
-        self._servers = resolve_servers(rs.server_names)
+        # Servers = the static config UNION whatever users picked at /start.
+        # This lets a user start tracking any wiki server on the fly without a
+        # config change; the picked server is then polled and its catalog fills.
+        await self._refresh_servers()
         if not self._servers:
-            logger.error(
-                f"No resolvable servers in REALESTATE_SERVERS/REALESTATE_SERVER "
-                f"({rs.server_names}); realestate source not started"
+            logger.warning(
+                f"No servers configured in REALESTATE_SERVERS/REALESTATE_SERVER "
+                f"({rs.server_names}) and none selected by users yet; "
+                f"realestate source idle until a user picks a server at /start"
             )
-            return
 
         self._running = True
-        listing = ", ".join(f"{n}({s})" for s, n in self._servers.items())
+        listing = ", ".join(f"{n}({s})" for s, n in self._servers.items()) or "—"
         logger.info(
             f"RealEstate scheduler started: servers=[{listing}], "
             f"interval={rs.interval}s"
@@ -74,6 +79,39 @@ class RealEstateScheduler:
         # Initial fetch to establish the baseline immediately.
         await self._tick()
         self._task = asyncio.create_task(self._loop())
+
+    async def _refresh_servers(self) -> None:
+        """Re-resolve the monitored set: configured servers ∪ user selections.
+
+        Called before every tick so a server a user picks at /start starts being
+        polled within one interval, without restarting the process. Order:
+        configured first (stable), then any extra user-picked sids.
+        """
+        rs = self.settings.realestate
+        servers = resolve_servers(rs.server_names)
+        try:
+            from app.database.repository import UserServerSelectionRepository
+            async with DatabaseSession.get_session_context() as session:
+                repo = UserServerSelectionRepository(session)
+                selected = await repo.all_selected_sids()
+        except Exception as e:
+            logger.warning(f"Could not read user server selections: {e}")
+            selected = []
+
+        for sid in selected:
+            if sid not in servers:
+                name = sid_to_server_name(sid)
+                if name:
+                    servers[sid] = name
+
+        if servers != self._servers:
+            added = {s: n for s, n in servers.items() if s not in self._servers}
+            if added:
+                logger.info(
+                    "RealEstate now also tracking user-picked server(s): "
+                    + ", ".join(f"{n}({s})" for s, n in added.items())
+                )
+        self._servers = servers
 
     async def stop(self) -> None:
         """Stop the polling loop."""
@@ -122,6 +160,8 @@ class RealEstateScheduler:
     async def _tick(self) -> int:
         """Fetch and diff every monitored server. Returns total change count."""
         self._last_tick = datetime.now(timezone.utc)
+        # Pick up any server a user selected at /start since the last tick.
+        await self._refresh_servers()
         total_changes = 0
         for sid, name in self._servers.items():
             total_changes += await self._tick_server(sid, name)

@@ -2,6 +2,8 @@
 
 import importlib
 
+import pytest
+
 from app.config import settings as settings_module
 from app.config.settings import (
     DatabaseSettings,
@@ -58,10 +60,9 @@ def test_smart_mode_validation_rejects_bad_interval(monkeypatch):
     monkeypatch.setenv("LOW_INTERVAL", "0")
     importlib.reload(settings_module)
     try:
-        settings_module.SmartModeSettings()
-        assert False, "expected AssertionError for LOW_INTERVAL=0"
-    except AssertionError:
-        pass
+        # Validation raises ValueError (not assert) so it survives `python -O`.
+        with pytest.raises(ValueError):
+            settings_module.SmartModeSettings()
     finally:
         monkeypatch.delenv("LOW_INTERVAL", raising=False)
         importlib.reload(settings_module)

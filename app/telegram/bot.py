@@ -124,10 +124,16 @@ class ApartmentBot:
         self.dp.callback_query.register(self._on_callback)
 
     def _is_admin(self, user_id: int) -> bool:
-        """Check if user is an admin."""
+        """Check if user is an admin.
+
+        Fail closed: if ALLOWED_USER_IDS is unset, nobody is an admin. Admin
+        actions gate destructive/operational commands (run scraper, toggle
+        crash detection, change notification settings), so an empty list must
+        NOT grant everyone access.
+        """
         allowed = self.settings.telegram.allowed_users
         if not allowed:
-            return True  # No restrictions
+            return False
         return user_id in allowed
 
     # ==================================================================
@@ -246,9 +252,28 @@ class ApartmentBot:
         rows.append([self._btn("⬅️ Назад", "menu:main")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    def _server_pick_markup(self, action: str) -> InlineKeyboardMarkup:
-        """One button per monitored server for the given action (buildings/houses/sub)."""
-        from app.scraper.realestate_client import resolve_servers
+    def _server_pick_markup(self, action: str,
+                            active_sid: Optional[str] = None) -> InlineKeyboardMarkup:
+        """Server picker for the given action (selsrv/buildings/houses/sub).
+
+        For `selsrv` (the active-server choice at /start) we offer the FULL wiki
+        server list — the user may start tracking any of them, and the scheduler
+        picks it up dynamically. For every other action we only list the servers
+        already configured/monitored, since those actions read existing catalog
+        data. The long full list is laid out two per row to stay compact; the
+        currently-active server (if any) is marked with a check.
+        """
+        from app.scraper.realestate_client import resolve_servers, all_wiki_servers
+
+        if action == "selsrv":
+            servers = all_wiki_servers()
+            btns = [
+                self._btn(f"{'✅ ' if sid == active_sid else '🌐 '}{name}", f"{action}:{sid}")
+                for sid, name in servers.items()
+            ]
+            rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+            rows.append([self._btn("⬅️ В меню", "menu:main")])
+            return InlineKeyboardMarkup(inline_keyboard=rows)
 
         servers = resolve_servers(self.settings.realestate.server_names)
         rows = [[self._btn(f"🌐 {name}", f"{action}:{sid}")] for sid, name in servers.items()]
@@ -299,18 +324,28 @@ class ApartmentBot:
                                       self._menu_markup(section, uid))
             return
 
+        # --- Active-server selection (persisted per user) ---
+        if data.startswith("selsrv:"):
+            sid = data.split(":", 1)[1]
+            from app.scraper.realestate_client import sid_to_server_name
+            await self._set_user_sid(uid, sid)
+            name = sid_to_server_name(sid) or f"sid {sid}"
+            await query.answer(f"🌐 Сервер: {name}")
+            await self._edit_menu(
+                query,
+                self._MENU_TEXT["main"] + f"\n\n<i>Активный сервер: {name}</i>",
+                self._get_keyboard(uid),
+            )
+            return
+
         # --- Server picker for catalog listings ---
         if data.startswith("pick:"):
             action = data.split(":", 1)[1]  # buildings | houses
-            from app.scraper.realestate_client import resolve_servers
-            servers = resolve_servers(self.settings.realestate.server_names)
             await query.answer()
-            if len(servers) <= 1:
-                sid = next(iter(servers), None)
-                await self._run_catalog(action, query.message, sid)
-            else:
-                await self._edit_menu(query, "<b>🌐 Выберите сервер</b>",
-                                      self._server_pick_markup(action))
+            # Default to the user's active server; the 🌐 Серверы screen is the
+            # place to switch, so we don't re-prompt on every listing.
+            sid, _ = await self._default_sid_for_user(uid)
+            await self._run_catalog(action, query.message, sid)
             return
 
         if data.startswith("buildings:") or data.startswith("houses:"):
@@ -550,6 +585,7 @@ class ApartmentBot:
 
         rs = self.settings.realestate
         servers = resolve_servers(rs.server_names)
+        active_sid, _ = await self._default_sid_for_user(user_id or message.from_user.id)
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -566,7 +602,8 @@ class ApartmentBot:
             "┣ Серверы:",
         ]
         for sid, name in servers.items():
-            lines.append(f"┃   • {name} (sid {sid}) — занятых: {occupied_by_server.get(sid, 0)}")
+            mark = " ⭐" if sid == active_sid else ""
+            lines.append(f"┃   • {name} (sid {sid}){mark} — занятых: {occupied_by_server.get(sid, 0)}")
         lines.append("┗ /subscribe &lt;сервер&gt; — подписка на уведомления")
 
         if recent:
@@ -622,13 +659,18 @@ class ApartmentBot:
         from app.scraper.realestate_client import server_name_to_sid
         return server_name_to_sid(self.settings.realestate.server_name)
 
-    def _parse_server_and_query(self, text: str, command: str) -> tuple:
+    def _parse_server_and_query(
+        self, text: str, command: str,
+        default_sid: Optional[str] = None, default_name: Optional[str] = None,
+    ) -> tuple:
         """Split a catalog command's args into (sid, server_name, remaining_query).
 
         A leading `server=<name>` or `@<name>` token, or a bare first token that
-        matches a monitored server name, selects that server; otherwise the
-        primary (REALESTATE_SERVER) is used and the whole arg is the query. This
-        keeps single-server usage unchanged while allowing per-server queries.
+        matches a monitored server name, selects that server. Otherwise we fall
+        back to `default_sid`/`default_name` (the caller passes the user's active
+        server) and, failing that, the primary REALESTATE_SERVER — so the whole
+        arg stays as the query. This keeps single-server usage unchanged while
+        allowing per-server queries and per-user defaults.
         """
         from app.scraper.realestate_client import server_name_to_sid, resolve_servers
 
@@ -651,14 +693,19 @@ class ApartmentBot:
                 arg = rest.strip()
 
         if chosen_sid is None:
-            chosen_name = self.settings.realestate.server_name
-            chosen_sid = server_name_to_sid(chosen_name)
+            if default_sid:
+                chosen_sid, chosen_name = default_sid, default_name
+            else:
+                chosen_name = self.settings.realestate.server_name
+                chosen_sid = server_name_to_sid(chosen_name)
 
         return chosen_sid, chosen_name, arg
 
     async def cmd_buildings(self, message: Message) -> None:
         """List apartment buildings with free/total counts."""
-        sid, server_name, _ = self._parse_server_and_query(message.text, "/buildings")
+        d_sid, d_name = await self._default_sid_for_user(message.from_user.id)
+        sid, server_name, _ = self._parse_server_and_query(
+            message.text, "/buildings", d_sid, d_name)
         await self._render_buildings(message, sid, server_name)
 
     async def _render_buildings(self, message: Message, sid: Optional[str],
@@ -692,7 +739,9 @@ class ApartmentBot:
 
     async def cmd_building(self, message: Message) -> None:
         """List all apartments (with owners) inside a building."""
-        sid, server_name, query = self._parse_server_and_query(message.text, "/building")
+        d_sid, d_name = await self._default_sid_for_user(message.from_user.id)
+        sid, server_name, query = self._parse_server_and_query(
+            message.text, "/building", d_sid, d_name)
         await self._render_building(message, sid, server_name, query)
 
     async def _render_building(self, message: Message, sid: Optional[str],
@@ -744,7 +793,9 @@ class ApartmentBot:
 
     async def cmd_houses(self, message: Message) -> None:
         """List occupied private houses with owners; optional search filter."""
-        sid, server_name, query = self._parse_server_and_query(message.text, "/houses")
+        d_sid, d_name = await self._default_sid_for_user(message.from_user.id)
+        sid, server_name, query = self._parse_server_and_query(
+            message.text, "/houses", d_sid, d_name)
         await self._render_houses(message, sid, server_name, query or None)
 
     async def _render_houses(self, message: Message, sid: Optional[str],
@@ -786,7 +837,9 @@ class ApartmentBot:
 
     async def cmd_owners(self, message: Message) -> None:
         """Find all objects (houses + apartments) owned by a nickname."""
-        sid, server_name, query = self._parse_server_and_query(message.text, "/owners")
+        d_sid, d_name = await self._default_sid_for_user(message.from_user.id)
+        sid, server_name, query = self._parse_server_and_query(
+            message.text, "/owners", d_sid, d_name)
         await self._render_owners(message, sid, server_name, query)
 
     async def _render_owners(self, message: Message, sid: Optional[str],
@@ -850,7 +903,7 @@ class ApartmentBot:
     # ---- Per-server notification subscriptions ----
 
     async def cmd_servers(self, message: Message, user_id: Optional[int] = None) -> None:
-        """List the servers currently monitored for realestate changes."""
+        """Show monitored servers and let the user pick their active one."""
         from app.scraper.realestate_client import resolve_servers
 
         servers = resolve_servers(self.settings.realestate.server_names)
@@ -859,12 +912,24 @@ class ApartmentBot:
                                  reply_markup=self._back_kb("catalog"))
             return
 
-        lines = ["<b>🌐 Отслеживаемые серверы</b>"]
+        uid = user_id or message.from_user.id
+        active_sid, active_name = await self._default_sid_for_user(uid)
+
+        # One button per server; the active one is marked. Tapping switches it.
+        rows = []
         for sid, name in servers.items():
-            lines.append(f"• {name} (sid {sid})")
-        lines.append("\n<i>Подписка: /subscribe &lt;сервер&gt; [house|apartment]</i>")
-        await message.answer("\n".join(lines), parse_mode="HTML",
-                             reply_markup=self._back_kb("catalog"))
+            mark = "✅ " if sid == active_sid else "🌐 "
+            rows.append([self._btn(f"{mark}{name}", f"selsrv:{sid}")])
+        rows.append([self._btn("⬅️ Назад", "menu:catalog")])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+
+        text = (
+            "<b>🌐 Серверы</b>\n"
+            f"Активный: <b>{active_name or '—'}</b>\n"
+            "Нажмите, чтобы переключить — списки и карта будут показывать его.\n"
+            "<i>Подписки на слёты: раздел 🔔 Подписки.</i>"
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
     async def cmd_subscribe(self, message: Message) -> None:
         """Subscribe the current user to freed-object alerts for a server."""
@@ -1099,6 +1164,22 @@ class ApartmentBot:
 
     async def cmd_start(self, message: Message) -> None:
         uid = message.from_user.id
+
+        # /start always asks which server to track: the user picks from the full
+        # wiki server list and the bot then follows that server for both the map
+        # view and the house/apartment catalog. The current choice (if any) is
+        # marked, so re-running /start doubles as a quick switcher.
+        active = await self._get_user_sid(uid)
+        await message.answer(
+            "<b>🏠 GTA5RP · Мониторинг недвижимости</b>\n"
+            "Выберите сервер, который хотите отслеживать — карта и статистика "
+            "домов/квартир будут показывать именно его.\n"
+            "<i>Сменить можно в любой момент: /start или 🌐 Серверы.</i>",
+            parse_mode="HTML",
+            reply_markup=self._server_pick_markup("selsrv", active_sid=active),
+        )
+
+    async def _send_main_menu(self, message: Message, uid: int) -> None:
         text = (
             "<b>🏠 GTA5RP · Мониторинг недвижимости</b>\n"
             "Слежу за квартирами, домами и слётами.\n\n"
@@ -1106,6 +1187,44 @@ class ApartmentBot:
             "<i>Открыть меню в любой момент: /menu</i>"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=self._get_keyboard(uid))
+
+    async def _get_user_sid(self, user_id: int) -> Optional[str]:
+        """A user's chosen active server sid, or None if they haven't picked one."""
+        from app.database.repository import UserServerSelectionRepository
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = UserServerSelectionRepository(session)
+            return await repo.get(user_id)
+
+    async def _set_user_sid(self, user_id: int, sid: str) -> None:
+        """Persist a user's active server selection (upsert)."""
+        from app.database.repository import UserServerSelectionRepository
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = UserServerSelectionRepository(session)
+            await repo.set(user_id, sid)
+
+    async def _default_sid_for_user(self, user_id: int) -> tuple:
+        """Resolve the server a catalog command should default to for this user.
+
+        Prefers the user's saved selection. Since /start now lets a user pick any
+        server from the full wiki list (not just the pre-configured ones), we
+        honour any valid wiki sid — the scheduler picks it up and starts filling
+        its catalog. Falls back to the configured primary REALESTATE_SERVER when
+        the user hasn't chosen yet. Returns (sid, server_name).
+        """
+        from app.scraper.realestate_client import (
+            sid_to_server_name, server_name_to_sid,
+        )
+
+        sid = await self._get_user_sid(user_id)
+        if sid:
+            name = sid_to_server_name(sid)
+            if name:
+                return sid, name
+
+        name = self.settings.realestate.server_name
+        return server_name_to_sid(name), name
 
     async def cmd_help(self, message: Message, user_id: Optional[int] = None) -> None:
         text = (

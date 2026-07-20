@@ -29,6 +29,12 @@ class ChangeNotifier:
     Runs as a background task to ensure timely delivery of alerts.
     """
 
+    # How long the Payday report waits for the browser map scrape to catch up to
+    # a catalog recompute before firing anyway. The catalog advances first and
+    # the map scrape lands seconds-to-minutes later; this bounds that wait so a
+    # broken/disabled scraper can never swallow a Payday summary forever.
+    _MAP_WAIT_GRACE = timedelta(minutes=10)
+
     def __init__(self, bot: Bot):
         self.bot = bot
         self.settings = get_settings()
@@ -39,6 +45,30 @@ class ChangeNotifier:
         # UTC time this notifier started; the per-Payday report only considers
         # events at/after this, so a restart never re-reports an old Payday.
         self._started_at: Optional[datetime] = None
+        # When we first saw a still-pending catalog recompute per server, keyed
+        # by "<sid>:<marker>". Drives the bounded grace period in _map_caught_up
+        # so a never-arriving map scrape still lets the report out eventually.
+        self._map_wait_since: dict = {}
+
+    def _in_payday_window(self) -> bool:
+        """Whether the current minute falls inside the configured Payday window.
+
+        During this window the catalog churns (objects blip out and back in as
+        the wiki recomputes), so instant per-event pings and the wall-clock
+        hourly report are unreliable — they can fire before the map has fully
+        settled. We suppress both here and let the single, recompute-gated
+        Payday report (`_maybe_send_payday_report`) be the source of truth once
+        the catalog's `fetchedAtMs` has actually advanced.
+        """
+        smart = self.settings.smart_mode
+        if not smart.smart_mode:
+            return False
+        minute = datetime.now(timezone.utc).minute
+        start, end = smart.payday_start_minute, smart.payday_end_minute
+        return (
+            start <= minute <= end if start <= end
+            else (minute >= start or minute <= end)
+        )
 
     async def _recipients_for_server(
         self, session, server_sid: Optional[str], kind: Optional[str] = None
@@ -98,6 +128,13 @@ class ChangeNotifier:
         now = datetime.now(timezone.utc)
         hour_key = now.strftime("%Y-%m-%d-%H")
         if self._last_report_hour == hour_key:
+            return
+
+        # Don't fire mid-Payday: the catalog is still churning and the map may
+        # not have refreshed yet. Defer (without latching the hour) so the report
+        # goes out once the window passes; the recompute-gated Payday report is
+        # the authoritative summary for the window itself.
+        if self._in_payday_window():
             return
 
         # On the very first loop iteration just latch the current hour; don't
@@ -179,6 +216,69 @@ class ChangeNotifier:
 
         return "\n".join(lines)
 
+    async def _map_caught_up(self, settings_repo, sid: str, catalog_marker: str) -> bool:
+        """Whether the browser map scrape has caught up to this catalog recompute.
+
+        Returns True once `map_scrape_done:<sid>` (the fetchedAtMs the map was
+        last scraped for) is >= the catalog recompute marker — i.e. the map has
+        refreshed for this Payday. Returns True immediately if map-gating cannot
+        apply (no completion marker was ever written, e.g. the map scraper /
+        MAP_UPDATE_GATE is disabled), so single-source deployments still report.
+
+        Safety valve: if the map marker exists but lags, we hold the report — but
+        only up to `_MAP_WAIT_GRACE`. If the browser scrape is stuck/broken and
+        never catches up, we release the report after the grace period so a
+        Payday summary is never lost. The first-seen time per (sid, marker) is
+        tracked in-memory; a restart just resets the clock, which is harmless.
+        """
+        done = await settings_repo.get(f"map_scrape_done:{sid}")
+
+        # No completion marker has ever been written for this server → the map
+        # scraper isn't correlating fetchedAtMs (gate off or map disabled). Don't
+        # gate; fall back to reporting on the catalog recompute alone.
+        if done is None:
+            return True
+
+        def _as_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return None
+
+        done_i, cat_i = _as_int(done), _as_int(catalog_marker)
+        # If either marker isn't a comparable integer, don't block the report.
+        if done_i is None or cat_i is None:
+            return True
+
+        # Grace timer is keyed per (sid, marker): a new recompute while we're
+        # still waiting gets its own fresh clock rather than inheriting the old
+        # one. Stale keys for this sid (older markers) are dropped as we go.
+        wait_key = f"{sid}:{catalog_marker}"
+
+        if done_i >= cat_i:
+            self._map_wait_since.pop(wait_key, None)
+            return True
+
+        # Map still behind. Start / check the grace timer for this recompute.
+        now = datetime.now(timezone.utc)
+        first_seen = self._map_wait_since.get(wait_key)
+        if first_seen is None:
+            self._map_wait_since[wait_key] = now
+            logger.info(
+                f"Payday report for sid {sid} held: waiting for map scrape "
+                f"(catalog={cat_i}, map={done_i})"
+            )
+            return False
+        if (now - first_seen) >= self._MAP_WAIT_GRACE:
+            logger.warning(
+                f"Payday report for sid {sid} released after grace period — map "
+                f"scrape never caught up (catalog={cat_i}, map={done_i}); "
+                f"reporting anyway"
+            )
+            self._map_wait_since.pop(wait_key, None)
+            return True
+        return False
+
     async def _maybe_send_payday_report(self) -> None:
         """Emit one report per server per Payday map update.
 
@@ -193,6 +293,11 @@ class ChangeNotifier:
         Gated behind the `payday_report` setting (on by default). The catalog's
         fetchedAtMs only advances when the wiki recomputes (around Payday), so
         firing on each advance is effectively one report per Payday.
+
+        The report is additionally held until the browser MAP scrape for the
+        same recompute has finished (`map_scrape_done:<sid>` >= the catalog
+        marker), so it never goes out before the map itself has refreshed. See
+        `_map_caught_up` for the bounded grace fallback.
         """
         async with DatabaseSession.get_session_context() as session:
             settings_repo = ScraperSettingsRepository(session)
@@ -226,6 +331,20 @@ class ChangeNotifier:
                 last_reported = await settings_repo.get(reported_key)
                 if last_reported == marker:
                     continue  # already reported this recompute
+
+                # Wait for the MAP to actually refresh before reporting. The
+                # catalog recompute (`catalog_recompute:<sid>`) only means the
+                # HTTP catalog advanced; the browser map scrape runs in its own
+                # loop and lands a moment later. Firing now would send the
+                # gov-report BEFORE the map updated — exactly the bug we're
+                # fixing. The map scraper stamps `map_scrape_done:<sid>` with the
+                # fetchedAtMs it scraped for, so we hold the report until that
+                # marker has caught up to (>=) this recompute. A bounded grace
+                # period is the safety valve: if the browser scrape is broken or
+                # disabled and never catches up, we still emit the report after
+                # `_MAP_WAIT_GRACE` so the Payday summary is never lost.
+                if not await self._map_caught_up(settings_repo, sid, marker):
+                    continue
 
                 now = datetime.now(timezone.utc)
                 # Window to summarise: everything freed since the previous report
@@ -358,6 +477,13 @@ class ChangeNotifier:
                         await change_repo.mark_notified(change.id)
                         continue
 
+                    if self._in_payday_window():
+                        # Suppress instant map-scraper free-ups mid-Payday for the
+                        # same reason as catalog events: the map is still settling.
+                        # The recompute-gated Payday report is authoritative.
+                        await change_repo.mark_notified(change.id)
+                        continue
+
                     message = self._build_change_message(change)
 
                     for user_id in self.settings.telegram.allowed_users:
@@ -392,6 +518,7 @@ class ChangeNotifier:
         """
         realestate_repo = RealEstateRepository(session)
         events = await realestate_repo.get_unnotified_events()
+        in_payday = self._in_payday_window()
 
         for event in events:
             try:
@@ -401,6 +528,16 @@ class ChangeNotifier:
                     continue
 
                 if notify_free != "1":
+                    await realestate_repo.mark_event_notified(event.id)
+                    continue
+
+                if in_payday:
+                    # Inside the Payday window the catalog churns: objects blip
+                    # out (looking "freed") and back in as the wiki recomputes,
+                    # so an instant ping here is often a false alarm fired before
+                    # the map settled. Swallow the instant message and let the
+                    # recompute-gated Payday report — which counts freed events
+                    # by detected_at once fetchedAtMs advances — be authoritative.
                     await realestate_repo.mark_event_notified(event.id)
                     continue
 

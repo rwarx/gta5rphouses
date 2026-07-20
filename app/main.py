@@ -24,8 +24,10 @@ async def run_all_services() -> None:
     # Initialize database
     await init_db()
 
-    # Create scheduler
-    scheduler = SmartScheduler()
+    # Create scheduler (shared singleton so the API's manual-trigger endpoint
+    # reuses the same browser lifecycle instead of spawning a second one).
+    from app.scraper.scheduler import get_scheduler
+    scheduler = get_scheduler()
 
     # Start scheduler
     scheduler_task = asyncio.create_task(scheduler.start())

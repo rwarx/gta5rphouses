@@ -26,7 +26,13 @@ const ScraperStatus = ({ api }) => {
     const triggerScrape = async () => {
         setScraping(true);
         try {
-            await api.get('/api/v1/scraper/trigger');
+            // Side-effecting endpoint: POST + bearer token. The token is read
+            // from the build-time env (REACT_APP_ADMIN_TOKEN); without it the
+            // backend returns 503 (endpoint disabled).
+            const token = process.env.REACT_APP_ADMIN_TOKEN;
+            await api.post('/api/v1/scraper/trigger', null, {
+                headers: token ? { Authorization: `Bearer ${token}` } : {},
+            });
         } catch (err) {
             console.error('Failed to trigger scrape:', err);
         }

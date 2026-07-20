@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:16-alpine
@@ -35,6 +33,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    # NOTE: this bind mount is a DEV convenience (hot reload) — it overlays the
+    # host tree onto the image-built code and pulls in the host .env. For a
+    # production deploy, remove this `volumes:` block so the image is immutable.
     volumes:
       - .:/app
       - /app/node_modules
@@ -49,6 +50,8 @@ services:
       - "8000:8000"
     environment:
       - SERVICE_MODE=all
+      # Allow the dockerized web UI origin through CORS (override in .env for prod).
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
     restart: unless-stopped
 
   frontend:

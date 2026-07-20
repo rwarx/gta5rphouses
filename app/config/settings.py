@@ -74,6 +74,11 @@ class ScraperSettings:
     # resolvable REALESTATE_SERVER. Fails open (scrapes) if the marker can't be
     # read, so a source hiccup never causes a missed update.
     map_update_gate: bool = env("MAP_UPDATE_GATE", "true").lower() == "true"
+    # Which server the map (browser) scraper selects on the wiki map. Was
+    # hard-coded to "Murrieta"; now configurable so the map view can follow the
+    # same server the realestate catalog monitors. Matching is case-insensitive
+    # substring against the map's server-card labels.
+    map_server: str = env("SCRAPER_SERVER", "Murrieta")
 
 
 class SmartModeSettings:
@@ -85,11 +90,16 @@ class SmartModeSettings:
     payday_end_minute: int = int(env("PAYDAY_END_MINUTE", "10"))
 
     def __init__(self):
-        # Validate
-        assert self.low_interval >= 1, "LOW_INTERVAL must be >= 1"
-        assert self.high_interval >= 1, "HIGH_INTERVAL must be >= 1"
-        assert 0 <= self.payday_start_minute <= 59, "PAYDAY_START_MINUTE must be 0-59"
-        assert 0 <= self.payday_end_minute <= 59, "PAYDAY_END_MINUTE must be 0-59"
+        # Validate. Use explicit raises (not assert) so validation survives
+        # `python -O`, which strips assert statements.
+        if self.low_interval < 1:
+            raise ValueError("LOW_INTERVAL must be >= 1")
+        if self.high_interval < 1:
+            raise ValueError("HIGH_INTERVAL must be >= 1")
+        if not 0 <= self.payday_start_minute <= 59:
+            raise ValueError("PAYDAY_START_MINUTE must be 0-59")
+        if not 0 <= self.payday_end_minute <= 59:
+            raise ValueError("PAYDAY_END_MINUTE must be 0-59")
 
 
 class TelegramSettings:
@@ -121,6 +131,23 @@ class APISettings:
     """API server settings."""
     api_host: str = env("API_HOST", "0.0.0.0")
     api_port: int = int(env("API_PORT", "8000"))
+    # Bearer token guarding side-effecting endpoints (e.g. /scraper/trigger).
+    # Empty => those endpoints are disabled entirely.
+    admin_token: str = env("API_ADMIN_TOKEN", "").strip()
+    # Comma-separated CORS allow-list for the web UI. Defaults to the local dev
+    # frontend. "*" is intentionally NOT the default: combined with credentials
+    # it is both insecure and ignored by browsers.
+    _cors_origins_raw: str = env("CORS_ORIGINS", "http://localhost:3000")
+
+    @property
+    def cors_origins(self) -> list:
+        """Parsed CORS allow-list (order-preserving, de-duplicated)."""
+        origins = []
+        for raw in self._cors_origins_raw.split(","):
+            origin = raw.strip()
+            if origin and origin not in origins:
+                origins.append(origin)
+        return origins
 
 
 class CrashDetectionSettings:
@@ -158,7 +185,8 @@ class RealEstateSettings:
     notify_possibly_freed: bool = env("REALESTATE_NOTIFY_POSSIBLY_FREED", "true").lower() == "true"
 
     def __init__(self):
-        assert self.interval >= 5, "REALESTATE_INTERVAL must be >= 5"
+        if self.interval < 5:
+            raise ValueError("REALESTATE_INTERVAL must be >= 5")
 
     @property
     def server_names(self) -> list:

@@ -164,6 +164,24 @@ class SmartScheduler:
         self._last_scraped_fetched_at_ms = fetched_ms
         return True
 
+    async def _mark_map_scrape_done(self, sid: str, fetched_ms: int) -> None:
+        """Record that the browser map scrape finished for this catalog recompute.
+
+        The Payday report reads `map_scrape_done:<sid>` and only fires once it
+        equals the catalog's `catalog_recompute:<sid>` marker — i.e. the map has
+        caught up to the data the report is about. Best-effort: a write failure
+        just means the report waits for the next scrape to stamp it.
+        """
+        try:
+            from app.database.repository import ScraperSettingsRepository
+            async with DatabaseSession.get_session_context() as session:
+                await ScraperSettingsRepository(session).set(
+                    f"map_scrape_done:{sid}", str(fetched_ms),
+                    "fetchedAtMs the browser map scrape last completed for",
+                )
+        except Exception as e:
+            logger.warning(f"Could not stamp map_scrape_done:{sid}: {e}")
+
     async def _smart_tick(self) -> None:
         now = datetime.now(timezone.utc)
         current_minute = now.minute
@@ -262,6 +280,18 @@ class SmartScheduler:
                 len(apartments_data), len(apartments_data), 0,
                 changes_count, duration
             )
+
+            # Stamp the map-update completion marker. The Payday report is gated
+            # on this: it must NOT fire until the browser map scrape for the same
+            # catalog recompute (fetchedAtMs) has finished, so a user never gets a
+            # "gov report" before the map itself has actually refreshed. We record
+            # the fetchedAtMs this scrape was run for (captured by the gate). With
+            # the gate off there's no fetchedAtMs to correlate, so we skip it and
+            # the report falls back to firing on the catalog recompute alone.
+            if self._map_gate_sid and self._last_scraped_fetched_at_ms is not None:
+                await self._mark_map_scrape_done(
+                    self._map_gate_sid, self._last_scraped_fetched_at_ms
+                )
 
             return apartments_data
 
@@ -470,3 +500,18 @@ class SmartScheduler:
         except Exception as e:
             logger.error(f"Failed to cache: {e}")
             self._icons_cached = False
+
+
+# Process-wide scheduler singleton. The manual-trigger API endpoint reuses this
+# so repeated calls don't each spin up a new, unmanaged browser. Note: the API
+# and the scraper worker run as separate processes in most deploy modes, so this
+# only shares state within a single process (e.g. SERVICE_MODE=all).
+_scheduler: Optional["SmartScheduler"] = None
+
+
+def get_scheduler() -> "SmartScheduler":
+    """Get or create the process-wide SmartScheduler singleton."""
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = SmartScheduler()
+    return _scheduler

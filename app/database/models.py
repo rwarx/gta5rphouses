@@ -273,3 +273,22 @@ class RealEstateSubscription(Base):
         UniqueConstraint("user_id", "server_sid", name="uq_subscription_user_server"),
         Index("idx_subscription_server", "server_sid"),
     )
+
+
+class UserServerSelection(Base):
+    """
+    A Telegram user's *active* server, chosen at /start.
+
+    Unlike subscriptions (which can span several servers for notifications),
+    this is the single server a user is "browsing": catalog commands
+    (buildings/houses/owners/realestate) and the map view default to it when
+    the command carries no explicit server argument. Exactly one row per user
+    (user_id is unique); selecting a new server upserts it.
+    """
+    __tablename__ = "user_server_selection"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
+    server_sid: Mapped[str] = mapped_column(String(8), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

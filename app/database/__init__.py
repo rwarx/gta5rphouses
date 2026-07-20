@@ -16,4 +16,5 @@ from app.database.models import (
     Notification,
     ScraperLog,
     RealEstateSubscription,
+    UserServerSelection,
 )

@@ -74,6 +74,16 @@ def resolve_servers(names: List[str]) -> Dict[str, str]:
     return resolved
 
 
+def all_wiki_servers() -> Dict[str, str]:
+    """Every server the wiki `/realestate` page lists, as an ordered {sid: name}.
+
+    This is the full pick-list offered at /start — the user may choose to track
+    any of them, not just the ones pre-configured in REALESTATE_SERVERS. The
+    scheduler then starts polling whichever server a user actually selects.
+    """
+    return {f"{idx + 1:02d}": name for idx, name in enumerate(SERVER_ORDER)}
+
+
 @dataclass
 class RealEstateUnit:
     """A single apartment or house entry from the catalog (an occupied object)."""

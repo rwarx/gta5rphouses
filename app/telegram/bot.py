@@ -121,7 +121,6 @@ class ApartmentBot:
         self.dp.message.register(self.cmd_unsubscribe, Command("unsubscribe"))
         self.dp.message.register(self.cmd_subscriptions, Command("subscriptions"))
         self.dp.message.register(self.cmd_menu, Command("menu"))
-        self.dp.message.register(self.cmd_vzp_check, Command("vzp_check"))
 
         # FSM: buttons that need free text put the user into a state; these
         # handlers read the next message and run the corresponding query.
@@ -1546,72 +1545,6 @@ class ApartmentBot:
             "<i>Мультисервер: /houses Strawberry, /buildings @Sunrise</i>"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("main"))
-
-    async def cmd_vzp_check(self, message: Message, user_id: Optional[int] = None) -> None:
-        """Cross-reference VZP participants with realestate owners (admin only)."""
-        from app.config import get_settings
-        uid = user_id or message.from_user.id
-        if not self._is_admin(uid):
-            await message.answer("⛔ Только для админов.")
-            return
-
-        import aiohttp
-        from sqlalchemy import text
-        from app.database.session import DatabaseSession
-
-        await message.answer("🔍 Собираю данные ВЗП...")
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://vzp-gta5rp.com/api/events?limit=100&offset=0",
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    events = await resp.json()
-        except Exception as e:
-            await message.answer(f"❌ Ошибка ВЗП API: {e}")
-            return
-
-        completed = [e for e in events if e.get("endedAt") and e.get("isAttackerWin") is not None]
-        all_vzp = set()
-        fetched = 0
-        async with aiohttp.ClientSession() as session:
-            for e in completed[:30]:
-                try:
-                    async with session.get(
-                        f'https://vzp-gta5rp.com/api/events/{e["eventId"]}',
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        detail = await resp.json()
-                    for p in (detail.get("attackers") or []) + (detail.get("defenders") or []):
-                        name = p.get("charName", "").strip()
-                        if name:
-                            all_vzp.add(name)
-                    fetched += 1
-                except Exception:
-                    continue
-
-        async with DatabaseSession.get_session_context() as session:
-            result = await session.execute(
-                text("SELECT DISTINCT owner_name FROM realestate_objects WHERE is_occupied = true AND owner_name IS NOT NULL")
-            )
-            db_owners = {row[0] for row in result if row[0]}
-
-        matched = db_owners & all_vzp
-        unmatched = db_owners - all_vzp
-
-        lines = [
-            "<b>🔍 Сверка ВЗП</b>",
-            f"📊 Владельцев в БД: {len(db_owners)}",
-            f"⚔️ ВЗП-сражений: {len(completed)}, обработано: {fetched}",
-            f"👤 Участников ВЗП (уникальных): {len(all_vzp)}",
-            "",
-            f"🟢 <b>Замечены в ВЗП</b> (были онлайн): {len(matched)}",
-            f"🔴 <b>Не замечены</b> (потенциально офлайн): {len(unmatched)}",
-        ]
-        if unmatched:
-            lines.append(f"\n  Пример: {', '.join(list(unmatched)[:10])}")
-        await message.answer("\n".join(lines), parse_mode="HTML")
 
     async def cmd_list(self, message: Message, user_id: Optional[int] = None) -> None:
         """List apartment buildings (free/total) for the user's selected server.

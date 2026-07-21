@@ -4,7 +4,7 @@ Provides data access abstraction over SQLAlchemy models.
 """
 
 from typing import Optional, List, Dict, Any, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import select, delete, update, func, and_, or_
@@ -704,6 +704,55 @@ class RealEstateRepository:
         if acquired is None:
             return None
         return at_time - acquired
+
+    async def get_all_current_ownership_durations(
+        self, server_sid: str
+    ) -> List[dict]:
+        """Return all occupied objects with current-owner acquisition time / duration.
+
+        Each dict contains object fields plus ``acquired_at`` (datetime or None)
+        and ``duration`` (timedelta or None). Objects without history entries
+        still appear (duration = None).
+        """
+        from sqlalchemy import text
+
+        rows = await self.session.execute(
+            text("""
+                SELECT
+                    ro.object_key, ro.kind, ro.unit_id, ro.name,
+                    ro.building_name, ro.class_name, ro.price,
+                    ro.vehicle_count, ro.owner_name,
+                    MIN(roh.recorded_at) AS acquired_at
+                FROM realestate_objects ro
+                LEFT JOIN realestate_owner_history roh
+                    ON roh.object_key = ro.object_key
+                    AND roh.owner_name = ro.owner_name
+                WHERE ro.server_sid = :sid
+                  AND ro.is_occupied = true
+                GROUP BY ro.object_key, ro.kind, ro.unit_id, ro.name,
+                         ro.building_name, ro.class_name, ro.price,
+                         ro.vehicle_count, ro.owner_name
+                ORDER BY acquired_at DESC NULLS LAST
+            """),
+            {"sid": server_sid},
+        )
+        now = datetime.now(timezone.utc)
+        return [
+            {
+                "object_key": r.object_key,
+                "kind": r.kind,
+                "unit_id": r.unit_id,
+                "name": r.name,
+                "building_name": r.building_name,
+                "class_name": r.class_name,
+                "price": r.price,
+                "vehicle_count": r.vehicle_count,
+                "owner_name": r.owner_name,
+                "acquired_at": r.acquired_at,
+                "duration": (now - r.acquired_at) if r.acquired_at else None,
+            }
+            for r in rows
+        ]
 
     # ---- Building aggregates ----
 

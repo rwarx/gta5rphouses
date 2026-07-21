@@ -233,6 +233,7 @@ class ApartmentBot:
                 [b("🏢 Статус каталога", "act:realestate")],
                 [b("🏢 Здания", "pick:buildings"), b("🏠 Дома", "pick:houses")],
                 [b("👤 По владельцу", "ask:owners"), b("📜 История ников", "ask:owner_history")],
+                [b("⏱ Срок владения", "act:ownership_durations")],
                 [b("🌐 Серверы", "act:servers")],
                 [b("⬅️ Назад", "menu:main")],
             ]
@@ -490,6 +491,7 @@ class ApartmentBot:
             "help": self.cmd_help,
             "report_now": self._report_now,
             "latest_data": self._latest_data,
+            "ownership_durations": self.cmd_ownership_durations,
         }
         handler = handlers.get(action)
         if handler:
@@ -796,21 +798,89 @@ class ApartmentBot:
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
-            buildings = await repo.get_buildings(sid)
+            all_apts = await repo.list_occupied(
+                sid, kind="apartment", limit=5000
+            )
 
-        if not buildings:
-            await message.answer("🏢 Данных о зданиях пока нет. Дождитесь первого сканирования.",
+        if not all_apts:
+            await message.answer("🏢 Занятых квартир пока нет. Дождитесь первого сканирования.",
                                  reply_markup=self._back_kb("catalog"))
             return
 
+        from collections import defaultdict
+        by_building = defaultdict(list)
+        for a in all_apts:
+            by_building[a.building_name or "Без здания"].append(a)
+
         lines = []
-        for b in buildings:
-            free = b.free_count if b.free_count is not None else 0
-            total = b.apartments_count if b.apartments_count is not None else "?"
-            icon = "🟢" if free else "🔴"
-            lines.append(f"{icon} {b.name} — свободно {free}/{total}")
-        lines.append("\n<i>Владельцы: /building &lt;название&gt;</i>")
-        await self._reply_chunked(message, lines, f"<b>🏢 Жилые здания · {server_name}</b>\n",
+        for bld_name in sorted(by_building):
+            units = sorted(by_building[bld_name], key=lambda u: u.unit_id)
+            total = len(units)
+            lines.append(f"\n<b>{bld_name}</b> — {total} кв.")
+            for u in units:
+                cls = f" · 🏷 {u.class_name}" if u.class_name else ""
+                garage = f" · 🚗 {u.vehicle_count}гм" if u.vehicle_count else ""
+                lines.append(
+                    f"🔴 {u.name or ('#' + str(u.unit_id))} · ID #{u.unit_id}{cls}{garage}\n"
+                    f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
+                )
+
+        header = f"<b>🏢 Все квартиры с владельцами · {server_name}</b>\n"
+        await self._reply_chunked(message, lines, header,
+                                  footer_kb=self._back_kb("catalog"))
+
+    async def cmd_ownership_durations(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Show how long each current owner has held their property."""
+        uid = user_id or message.from_user.id
+        d_sid, d_name = await self._default_sid_for_user(uid)
+        if not d_sid:
+            await message.answer("⚠️ Сначала выберите сервер.")
+            return
+        from app.scraper.realestate_client import sid_to_server_name
+        server_name = sid_to_server_name(d_sid) or f"sid {d_sid}"
+        await self._render_ownership_durations(message, d_sid, server_name)
+
+    async def _render_ownership_durations(
+        self, message: Message, sid: str, server_name: str
+    ) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.telegram.notifier import format_duration
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            rows = await repo.get_all_current_ownership_durations(sid)
+
+        if not rows:
+            await message.answer("⏱ Нет данных о времени владения.",
+                                 reply_markup=self._back_kb("catalog"))
+            return
+
+        houses = [r for r in rows if r["kind"] == "house"]
+        apts = [r for r in rows if r["kind"] == "apartment"]
+
+        lines = []
+        if houses:
+            lines.append("<b>🏠 Дома</b>")
+            for r in sorted(houses, key=lambda x: (x["duration"] or timedelta()).total_seconds(), reverse=True):
+                dur = format_duration(r["duration"]) if r["duration"] else "—"
+                name = r["name"] or f"Дом #{r['unit_id']}"
+                lines.append(f"• {name} · 👤 {r['owner_name']} — ⏱ {dur}")
+        if apts:
+            if houses:
+                lines.append("")
+            lines.append("<b>🏢 Квартиры</b>")
+            by_bld = sorted(apts, key=lambda x: (
+                x.get("building_name") or "",
+                (x["duration"] or timedelta()).total_seconds()
+            ), reverse=True)
+            for r in by_bld:
+                dur = format_duration(r["duration"]) if r["duration"] else "—"
+                where = f" · {r['building_name']}" if r.get("building_name") else ""
+                name = r["name"] or f"#{r['unit_id']}"
+                lines.append(f"• {name}{where} · 👤 {r['owner_name']} — ⏱ {dur}")
+
+        header = f"<b>⏱ Срок владения · {server_name}</b>\n"
+        await self._reply_chunked(message, lines, header,
                                   footer_kb=self._back_kb("catalog"))
 
     async def cmd_building(self, message: Message) -> None:

@@ -75,19 +75,15 @@ class ChangeNotifier:
     ) -> List[int]:
         """Resolve who should receive an alert for a server.
 
-        Users subscribed to the server (and matching kind) get it; if the server
-        has no subscribers we fall back to the globally allowed users so alerts
-        are never silently dropped. When no sid is known we also fall back.
+        Only users subscribed to the server (and matching kind) get it.
         """
-        allowed = list(self.settings.telegram.allowed_users)
         if not server_sid:
-            return allowed
+            return []
 
         sub_repo = SubscriptionRepository(session)
         subs = await sub_repo.get_subscribers(server_sid, kind=kind)
         subscriber_ids = [s.user_id for s in subs]
         if subscriber_ids:
-            # De-duplicate while preserving order.
             seen = set()
             unique = []
             for uid in subscriber_ids:
@@ -95,7 +91,7 @@ class ChangeNotifier:
                     seen.add(uid)
                     unique.append(uid)
             return unique
-        return allowed
+        return []
 
     async def start(self) -> None:
         """Start the notification monitoring loop."""

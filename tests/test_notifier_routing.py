@@ -42,20 +42,20 @@ async def test_recipients_kind_filter(session):
     await repo.subscribe(user_id=1, server_sid="20", kind="apartment")
 
     notifier = _make_notifier(allowed_users=[99])
-    # A house event has no apartment-only subscriber -> falls back to allowed.
+    # A house event has no apartment-only subscriber -> no one gets it.
     recipients = await notifier._recipients_for_server(session, "20", kind="house")
-    assert recipients == [99]
+    assert recipients == []
 
 
 @pytest.mark.asyncio
-async def test_recipients_falls_back_to_allowed_when_no_subs(session):
+async def test_recipients_empty_when_no_subscribers(session):
     notifier = _make_notifier(allowed_users=[1, 2, 3])
     recipients = await notifier._recipients_for_server(session, "20", kind="house")
-    assert recipients == [1, 2, 3]
+    assert recipients == []
 
 
 @pytest.mark.asyncio
-async def test_recipients_falls_back_when_no_sid(session):
+async def test_recipients_empty_when_no_sid(session):
     notifier = _make_notifier(allowed_users=[7])
     recipients = await notifier._recipients_for_server(session, None)
-    assert recipients == [7]
+    assert recipients == []

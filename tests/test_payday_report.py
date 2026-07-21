@@ -13,6 +13,7 @@ import pytest
 from app.database.repository import (
     RealEstateRepository,
     ScraperSettingsRepository,
+    SubscriptionRepository,
 )
 from app.telegram.notifier import ChangeNotifier
 
@@ -126,6 +127,10 @@ async def test_payday_report_fires_once_per_recompute(session, monkeypatch):
     # Adopt an initial recompute marker without reporting (first-sight rule).
     await settings_repo.set("catalog_recompute:20", "1000")
 
+    await SubscriptionRepository(session).subscribe(
+        user_id=42, server_sid="20", kind="any"
+    )
+
     notifier = _make_notifier(allowed_users=[42], monitored_names=["Murrieta"])
 
     # Feed the notifier this session so it uses the same in-memory DB.
@@ -185,6 +190,10 @@ async def test_payday_report_waits_for_map_scrape(session, monkeypatch):
     await settings_repo.set("payday_report_marker:20", "1000")
     await settings_repo.set("map_scrape_done:20", "1000")
 
+    await SubscriptionRepository(session).subscribe(
+        user_id=42, server_sid="20", kind="any"
+    )
+
     notifier = _make_notifier(allowed_users=[42], monitored_names=["Murrieta"])
 
     import app.telegram.notifier as notifier_mod
@@ -235,6 +244,10 @@ async def test_payday_report_fires_when_no_map_marker(session, monkeypatch):
     await settings_repo.set("payday_report_marker:20", "1000")
     # Note: no map_scrape_done:20 set at all.
 
+    await SubscriptionRepository(session).subscribe(
+        user_id=42, server_sid="20", kind="any"
+    )
+
     notifier = _make_notifier(allowed_users=[42], monitored_names=["Murrieta"])
 
     import app.telegram.notifier as notifier_mod
@@ -269,6 +282,10 @@ async def test_payday_report_empty_when_nothing_freed(session, monkeypatch):
 
     settings_repo = ScraperSettingsRepository(session)
     await settings_repo.set("catalog_recompute:20", "1000")
+
+    await SubscriptionRepository(session).subscribe(
+        user_id=7, server_sid="20", kind="any"
+    )
 
     notifier = _make_notifier(allowed_users=[7], monitored_names=["Murrieta"])
 
@@ -402,6 +419,10 @@ async def test_freed_event_sent_instantly_outside_payday_window(session, monkeyp
 
     notifier = _make_notifier([42], ["Murrieta"], smart_mode=True)
     notifier._in_payday_window = lambda: False
+
+    await SubscriptionRepository(session).subscribe(
+        user_id=42, server_sid="20", kind="any"
+    )
 
     await _add_freed(session, "20", "house", "Вилла", 1)
 

@@ -87,7 +87,7 @@ class SmartModeSettings:
     low_interval: int = int(env("LOW_INTERVAL", "600"))
     high_interval: int = int(env("HIGH_INTERVAL", "60"))
     payday_start_minute: int = int(env("PAYDAY_START_MINUTE", "59"))
-    payday_end_minute: int = int(env("PAYDAY_END_MINUTE", "15"))
+    payday_end_minute: int = int(env("PAYDAY_END_MINUTE", "10"))
 
     def __init__(self):
         # Validate. Use explicit raises (not assert) so validation survives

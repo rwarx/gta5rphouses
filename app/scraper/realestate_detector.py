@@ -107,17 +107,20 @@ class RealEstateDetector:
                     name=unit.name or "", new_owner=unit.owner_name,
                 ))
             elif prev_obj is not None and (prev_owner or None) != (unit.owner_name or None):
-                # Owner change on an object that stayed occupied. During Payday
-                # this is a "possibly_freed" signal; otherwise an ordinary resale.
-                event_type = "possibly_freed" if is_payday else "owner_changed"
-                await self.repo.add_owner_history(
-                    object_key=key,
-                    server_sid=server_sid,
-                    kind=unit.kind,
-                    owner_name=unit.owner_name,
-                    previous_owner=prev_owner,
-                    during_payday=is_payday,
-                )
+                # Owner changed. If the new owner is empty the object freed.
+                if not unit.owner_name:
+                    event_type = "freed"
+                    await self.repo.mark_freed(key)
+                else:
+                    event_type = "possibly_freed" if is_payday else "owner_changed"
+                    await self.repo.add_owner_history(
+                        object_key=key,
+                        server_sid=server_sid,
+                        kind=unit.kind,
+                        owner_name=unit.owner_name,
+                        previous_owner=prev_owner,
+                        during_payday=is_payday,
+                    )
                 await self.repo.create_event(
                     self._event_data(
                         server_sid, unit, event_type,

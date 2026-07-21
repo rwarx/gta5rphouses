@@ -105,6 +105,7 @@ class SmartModeSettings:
 class TelegramSettings:
     """Telegram bot settings."""
     bot_token: str = env("BOT_TOKEN", "")
+    bot_password: str = env("BOT_PASSWORD", "lovlyanaxuy22811")
     allowed_user_ids: str = env("ALLOWED_USER_IDS", "")
 
     @property

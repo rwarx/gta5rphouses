@@ -30,6 +30,7 @@ class BotStates(StatesGroup):
     owners = State()          # owner nickname lookup (/owners)
     building = State()        # building name lookup (/building)
     owner_history = State()   # object owner timeline (/owner_history)
+    login = State()           # password entry state
 
 from app.config import get_settings
 from app.database.session import DatabaseSession
@@ -51,6 +52,9 @@ class ApartmentBot:
         self.scheduler = scheduler
         self.bot: Optional[Bot] = None
         self.dp: Optional[Dispatcher] = None
+        # Users who entered the correct bot password (in-memory, resets on restart).
+        # Admin users (ALLOWED_USER_IDS) skip password check entirely.
+        self._authorized_users: set[int] = set()
 
     async def start(self) -> None:
         """Initialize and start the bot."""
@@ -61,6 +65,10 @@ class ApartmentBot:
         logger.info("Starting Telegram bot...")
         self.bot = Bot(token=self.settings.telegram.bot_token)
         self.dp = Dispatcher(storage=MemoryStorage())
+
+        # Auth middleware: reject messages and callbacks from unauthorized users
+        self.dp.message.outer_middleware.register(self._auth_middleware)
+        self.dp.callback_query.outer_middleware.register(self._auth_middleware)
 
         # Register handlers
         self._register_handlers()
@@ -82,6 +90,7 @@ class ApartmentBot:
 
         # Register commands
         self.dp.message.register(self.cmd_start, CommandStart())
+        self.dp.message.register(self.cmd_password, Command("password"))
         self.dp.message.register(self.cmd_help, Command("help"))
         self.dp.message.register(self.cmd_list, Command("list"))
         self.dp.message.register(self.cmd_search, Command("search"))
@@ -121,9 +130,22 @@ class ApartmentBot:
         self.dp.message.register(self._state_owners, BotStates.owners)
         self.dp.message.register(self._state_building, BotStates.building)
         self.dp.message.register(self._state_owner_history, BotStates.owner_history)
+        self.dp.message.register(self._state_login, BotStates.login)
 
         # Register callback queries
         self.dp.callback_query.register(self._on_callback)
+
+
+
+    def _check_auth(self, user_id: int) -> bool:
+        """Check if a user is authorized (entered correct password or is admin).
+
+        Admin users skip the password gate entirely. Regular users must have
+        entered the bot password at /start to use commands.
+        """
+        if self._is_admin(user_id):
+            return True
+        return user_id in self._authorized_users
 
     def _is_admin(self, user_id: int) -> bool:
         """Check if user is an admin.
@@ -280,10 +302,16 @@ class ApartmentBot:
             rows.append([self._btn("⬅️ В меню", "menu:main")])
             return InlineKeyboardMarkup(inline_keyboard=rows)
 
+        if action == "subkind":
+            servers = all_wiki_servers()
+            btns = [self._btn(f"🌐 {name}", f"{action}:{sid}") for sid, name in servers.items()]
+            rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+            rows.append([self._btn("⬅️ Назад", "menu:subs")])
+            return InlineKeyboardMarkup(inline_keyboard=rows)
+
         servers = resolve_servers(self.settings.realestate.server_names)
         rows = [[self._btn(f"🌐 {name}", f"{action}:{sid}")] for sid, name in servers.items()]
-        back = "menu:subs" if action == "subkind" else "menu:catalog"
-        rows.append([self._btn("⬅️ Назад", back)])
+        rows.append([self._btn("⬅️ Назад", "menu:catalog")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _sub_kind_markup(self, sid: str) -> InlineKeyboardMarkup:
@@ -432,6 +460,9 @@ class ApartmentBot:
 
     async def cmd_menu(self, message: Message, state: Optional[FSMContext] = None) -> None:
         """Open the main inline menu (also the escape hatch from any FSM prompt)."""
+        if not self._check_auth(message.from_user.id):
+            await self.cmd_start(message, state)
+            return
         if state is not None:
             await state.clear()
         await message.answer(self._MENU_TEXT["main"], parse_mode="HTML",
@@ -1255,13 +1286,20 @@ class ApartmentBot:
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("reports"))
 
-    async def cmd_start(self, message: Message) -> None:
+    async def cmd_start(self, message: Message, state: Optional[FSMContext] = None) -> None:
         uid = message.from_user.id
 
-        # /start always asks which server to track: the user picks from the full
-        # wiki server list and the bot then follows that server for both the map
-        # view and the house/apartment catalog. The current choice (if any) is
-        # marked, so re-running /start doubles as a quick switcher.
+        if not self._check_auth(uid):
+            await state.set_state(BotStates.login)
+            await message.answer(
+                "🔑 <b>Добро пожаловать!</b>\n"
+                "Бот защищён паролем. Введите пароль для доступа:\n\n"
+                "<i>Команда /start для повторного ввода</i>",
+                parse_mode="HTML",
+            )
+            return
+
+        # /start always asks which server to track
         active = await self._get_user_sid(uid)
         await message.answer(
             "<b>🏠 GTA5RP · Мониторинг недвижимости</b>\n"
@@ -1271,6 +1309,34 @@ class ApartmentBot:
             parse_mode="HTML",
             reply_markup=self._server_pick_markup("selsrv", active_sid=active),
         )
+
+    async def cmd_password(self, message: Message, state: FSMContext) -> None:
+        """Re-enter the bot password."""
+        await state.set_state(BotStates.login)
+        await message.answer(
+            "🔑 Введите пароль для доступа к боту:",
+            parse_mode="HTML",
+        )
+
+    async def _state_login(self, message: Message, state: FSMContext) -> None:
+        """Handle password entry."""
+        text = (message.text or "").strip()
+        uid = message.from_user.id
+
+        if not text:
+            await message.answer("⚠️ Пожалуйста, введите пароль.")
+            return
+
+        if text == self.settings.telegram.bot_password:
+            self._authorized_users.add(uid)
+            await state.clear()
+            await self.cmd_start(message)
+        else:
+            await message.answer(
+                "❌ <b>Неверный пароль!</b>\n"
+                "Попробуйте снова или обратитесь к администратору.",
+                parse_mode="HTML",
+            )
 
     async def _send_main_menu(self, message: Message, uid: int) -> None:
         text = (
@@ -1318,6 +1384,37 @@ class ApartmentBot:
 
         name = self.settings.realestate.server_name
         return server_name_to_sid(name), name
+
+    async def _auth_middleware(self, handler, event, data) -> None:
+        """Middleware: block messages/callbacks from unauthorized users.
+
+        Skips the check for /start, /password, and messages in the login FSM
+        state so the auth flow itself works. Every other command and callback
+        requires a valid password or admin status.
+        """
+        from aiogram.types import Message as TgMsg, CallbackQuery as TgCb
+
+        if isinstance(event, TgMsg):
+            text = (event.text or "").strip()
+            if text in ("/start", "/password"):
+                return await handler(event, data)
+            state = data.get("state")
+            if state and await state.get_state() == BotStates.login:
+                return await handler(event, data)
+            if not self._check_auth(event.from_user.id):
+                await event.answer(
+                    "🔑 <b>Требуется авторизация</b>\n"
+                    "Введите пароль: /password или /start",
+                    parse_mode="HTML",
+                )
+                return
+
+        elif isinstance(event, TgCb):
+            if not self._check_auth(event.from_user.id):
+                await event.answer("🔑 Сначала авторизуйтесь: /start", show_alert=True)
+                return
+
+        return await handler(event, data)
 
     async def cmd_help(self, message: Message, user_id: Optional[int] = None) -> None:
         text = (

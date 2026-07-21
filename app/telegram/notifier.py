@@ -157,7 +157,7 @@ class ChangeNotifier:
         # by "<sid>:<marker>". Drives the bounded grace period in _map_caught_up
         # so a never-arriving map scrape still lets the report out eventually.
         self._map_wait_since: dict = {}
-        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (since, until, sent_at)
+        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (since, until, sent_at, server_sid)
         self._pending_edits: dict = {}
 
     def _in_payday_window(self) -> bool:
@@ -295,7 +295,7 @@ class ChangeNotifier:
                     msg = await send_notification(self.bot, user_id, message)
                     if msg:
                         key = (user_id, msg.message_id)
-                        self._pending_edits[key] = (since, now, datetime.now(timezone.utc))
+                        self._pending_edits[key] = (since, now, datetime.now(timezone.utc), sid)
 
     def _build_hourly_report(self, events, since, now, server_sid=None,
                              ownership_durations: Optional[dict] = None) -> str:
@@ -346,33 +346,13 @@ class ChangeNotifier:
         """Edit hourly reports sent as "быстрый отчёт" → rebuild content + "точные данные"."""
         now = datetime.now(timezone.utc)
         expired = [
-            key for key, (_, _, sent_at) in self._pending_edits.items()
+            key for key, (_, _, sent_at, _) in self._pending_edits.items()
             if now - sent_at >= self._REPORT_FINALIZE_DELAY
         ]
         for chat_id, msg_id in expired:
             key = (chat_id, msg_id)
-            since, until, _ = self._pending_edits.pop(key)
-            try:
-                async with DatabaseSession.get_session_context() as session:
-                    repo = RealEstateRepository(session)
-                    events = await repo.get_events_since(since, until=until)
-                    message = self._build_hourly_report(events, since, until)
-                    message = message.replace(
-                        "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
-                        "🕐✅ <b>Точные данные</b>",
-                    ).replace(
-                        "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
-                    ).replace(
-                        " (данные уточняются)</b>", "</b>"
-                    )
-                    await self.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=message,
-                        parse_mode="HTML",
-                    )
-            except Exception as e:
-                logger.debug(f"Failed to edit report for {chat_id}: {e}")
+            since, until, _, _ = self._pending_edits.pop(key)
+            await self._rebuild_and_edit_report(chat_id, msg_id, since, until)
 
     async def _map_caught_up(self, settings_repo, sid: str, catalog_marker: str) -> bool:
         """Whether the browser map scrape has caught up to this catalog recompute.
@@ -552,6 +532,52 @@ class ChangeNotifier:
                 message = self._build_payday_report(events, sid)
                 for user_id in recipients:
                     await send_notification(self.bot, user_id, message)
+
+                # Finalise any pending hourly report for this server now that
+                # the map has caught up and the Payday report is out.
+                await self._finalise_hourly_for_server(session, sid, recipients)
+
+    async def _finalise_hourly_for_server(
+        self, session, server_sid: str, recipients: List[int]
+    ) -> None:
+        """Edit pending hourly reports for a server that just got Payday data."""
+        now = datetime.now(timezone.utc)
+        hands: List[tuple] = []
+        for (cid, mid), val in list(self._pending_edits.items()):
+            since, until, sent_at, sv = val
+            if sv != server_sid or cid not in recipients:
+                continue
+            hands.append((cid, mid, since, until))
+        for cid, mid, since, until in hands:
+            key = (cid, mid)
+            self._pending_edits.pop(key, None)
+            await self._rebuild_and_edit_report(cid, mid, since, until)
+
+    async def _rebuild_and_edit_report(
+        self, chat_id: int, msg_id: int, since: datetime, until: datetime
+    ) -> None:
+        """Re-query events for a time window and edit the message in place."""
+        try:
+            async with DatabaseSession.get_session_context() as session:
+                repo = RealEstateRepository(session)
+                events = await repo.get_events_since(since, until=until)
+                message = self._build_hourly_report(events, since, until)
+                message = message.replace(
+                    "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
+                    "🕐✅ <b>Точные данные</b>",
+                ).replace(
+                    "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
+                ).replace(
+                    " (данные уточняются)</b>", "</b>"
+                )
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=message,
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.debug(f"Failed to edit report {chat_id}/{msg_id}: {e}")
 
     def _build_payday_report(self, events, server_sid=None) -> str:
         """Render the freed houses + apartments of one Payday as a report.

@@ -58,6 +58,7 @@ def _make_notifier(
     notifier.bot = object()  # send_notification is monkeypatched, never touched
     notifier._started_at = datetime.now(timezone.utc) - timedelta(hours=2)
     notifier._map_wait_since = {}
+    notifier._pending_edits = {}
     return notifier
 
 

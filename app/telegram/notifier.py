@@ -117,6 +117,7 @@ class ChangeNotifier:
     # the map scrape lands seconds-to-minutes later; this bounds that wait so a
     # broken/disabled scraper can never swallow a Payday summary forever.
     _MAP_WAIT_GRACE = timedelta(minutes=10)
+    _REPORT_FINALIZE_DELAY = timedelta(minutes=10)
 
     def __init__(self, bot: Bot):
         self.bot = bot
@@ -132,6 +133,8 @@ class ChangeNotifier:
         # by "<sid>:<marker>". Drives the bounded grace period in _map_caught_up
         # so a never-arriving map scrape still lets the report out eventually.
         self._map_wait_since: dict = {}
+        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (text, sent_at)
+        self._pending_edits: dict = {}
 
     def _in_payday_window(self) -> bool:
         """Whether the current minute falls inside the configured Payday window.
@@ -191,6 +194,7 @@ class ChangeNotifier:
                 await self._process_pending_notifications()
                 await self._maybe_send_hourly_report()
                 await self._maybe_send_payday_report()
+                await self._edit_expired_reports()
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Notification loop error: {e}")
@@ -207,13 +211,6 @@ class ChangeNotifier:
         now = datetime.now(timezone.utc)
         hour_key = now.strftime("%Y-%m-%d-%H")
         if self._last_report_hour == hour_key:
-            return
-
-        # Don't fire mid-Payday: the catalog is still churning and the map may
-        # not have refreshed yet. Defer (without latching the hour) so the report
-        # goes out once the window passes; the recompute-gated Payday report is
-        # the authoritative summary for the window itself.
-        if self._in_payday_window():
             return
 
         # On the very first loop iteration just latch the current hour; don't
@@ -256,7 +253,10 @@ class ChangeNotifier:
                     continue
                 message = self._build_hourly_report(server_events, since, now, sid)
                 for user_id in recipients:
-                    await send_notification(self.bot, user_id, message)
+                    msg = await send_notification(self.bot, user_id, message)
+                    if msg:
+                        key = (user_id, msg.message_id)
+                        self._pending_edits[key] = (msg.text, datetime.now(timezone.utc))
 
     def _build_hourly_report(self, events, since, now, server_sid=None) -> str:
         """Render the last hour of catalog events as one compact report."""
@@ -272,9 +272,9 @@ class ChangeNotifier:
 
         period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
         server = sid_to_server_name(server_sid) if server_sid else None
-        header = "🕐 <b>Почасовой отчёт (пейдей)</b>"
+        header = "🕐 <b>Быстрый отчёт (данные уточняются)</b>"
         if server:
-            header = f"🕐 <b>Почасовой отчёт (пейдей) — {server}</b>"
+            header = f"🕐 <b>Быстрый отчёт — {server} (данные уточняются)</b>"
         lines = [
             header,
             f"<i>{period}</i>",
@@ -298,6 +298,36 @@ class ChangeNotifier:
                 lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
 
         return "\n".join(lines)
+
+    async def _edit_expired_reports(self) -> None:
+        """Edit hourly reports that were sent as "быстрый отчёт" to "данные уточнены"."""
+        now = datetime.now(timezone.utc)
+        expired = [
+            key for key, (_, sent_at) in self._pending_edits.items()
+            if now - sent_at >= self._REPORT_FINALIZE_DELAY
+        ]
+        for chat_id, msg_id in expired:
+            key = (chat_id, msg_id)
+            text, _ = self._pending_edits.pop(key, (None, None))
+            if not text:
+                continue
+            new_text = text.replace(
+                "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
+                "🕐✅ <b>Точные данные</b>",
+            ).replace(
+                "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
+            )
+            if new_text == text:
+                continue
+            try:
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=new_text,
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.debug(f"Failed to edit report for {chat_id}: {e}")
 
     async def _map_caught_up(self, settings_repo, sid: str, catalog_marker: str) -> bool:
         """Whether the browser map scrape has caught up to this catalog recompute.

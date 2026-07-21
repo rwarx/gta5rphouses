@@ -1875,7 +1875,7 @@ async def send_notification(
     bot: Bot,
     chat_id: int,
     text: str,
-) -> bool:
+) -> Optional[Message]:
     """
     Send a notification to a specific user.
 
@@ -1885,26 +1885,26 @@ async def send_notification(
         text: Message text.
 
     Returns:
-        True if sent successfully.
+        The sent Message if successful, None otherwise.
     """
     try:
-        await bot.send_message(
+        msg = await bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
-        return True
+        return msg
     except TelegramForbiddenError:
         logger.warning(f"User {chat_id} blocked the bot")
-        return False
+        return None
     except TelegramRetryAfter as e:
         logger.warning(f"Rate limited, waiting {e.retry_after}s")
         await asyncio.sleep(e.retry_after)
         return await send_notification(bot, chat_id, text)
     except Exception as e:
         logger.error(f"Failed to send notification to {chat_id}: {e}")
-        return False
+        return None
 
 
 async def run_bot(scheduler: Optional[SmartScheduler] = None) -> None:

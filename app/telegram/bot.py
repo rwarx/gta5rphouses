@@ -456,6 +456,13 @@ class ApartmentBot:
             await self._run_action(data.split(":", 1)[1], query.message, uid)
             return
 
+        # --- Owner history callback ---
+        if data.startswith("hst:"):
+            await query.answer()
+            object_key = data.split(":", 1)[1]
+            await self._render_owner_history(query.message, object_key)
+            return
+
         await query.answer("Неизвестная команда", show_alert=True)
 
     async def cmd_menu(self, message: Message, state: Optional[FSMContext] = None) -> None:
@@ -1114,6 +1121,7 @@ class ApartmentBot:
 
     async def _render_owner_history(self, message: Message, query: str) -> None:
         from app.database.repository import RealEstateRepository
+        from app.telegram.notifier import format_duration
 
         if not query:
             await message.answer(
@@ -1126,7 +1134,7 @@ class ApartmentBot:
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
             obj = await repo.get_object(query)
-            history = await repo.get_owner_history(query, limit=30)
+            history = await repo.get_owner_history_chronological(query, limit=50)
 
         if not obj and not history:
             await message.answer(f"🔍 Объект «{query}» не найден.",
@@ -1138,11 +1146,20 @@ class ApartmentBot:
         if not history:
             lines.append("<i>Смен владельца не зафиксировано.</i>")
         else:
-            for h in history:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            for i, h in enumerate(history):
                 when = h.recorded_at.strftime("%d.%m %H:%M") if h.recorded_at else "—"
-                pd = " ⚡️Payday" if h.during_payday else ""
+                # Duration: for the latest entry → now, for older → next entry - current
+                if i == len(history) - 1:
+                    dur_td = now - h.recorded_at if h.recorded_at else timedelta()
+                else:
+                    dur_td = history[i + 1].recorded_at - h.recorded_at if h.recorded_at and history[i + 1].recorded_at else timedelta()
+                dur_str = format_duration(dur_td) if dur_td.total_seconds() > 0 else ""
+                dur_text = f" — <b>{dur_str}</b>" if dur_str else ""
+                pd = " ⚡️" if h.during_payday else ""
                 lines.append(
-                    f"• {when}: {h.previous_owner or '—'} → {h.owner_name or '—'}{pd}"
+                    f"• {when}{pd}: {h.previous_owner or '—'} → {h.owner_name or '—'}{dur_text}"
                 )
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("catalog"))
@@ -1875,6 +1892,7 @@ async def send_notification(
     bot: Bot,
     chat_id: int,
     text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional[Message]:
     """
     Send a notification to a specific user.
@@ -1883,6 +1901,7 @@ async def send_notification(
         bot: Bot instance.
         chat_id: Telegram user ID.
         text: Message text.
+        reply_markup: Optional inline keyboard.
 
     Returns:
         The sent Message if successful, None otherwise.
@@ -1893,6 +1912,7 @@ async def send_notification(
             text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=reply_markup,
         )
         return msg
     except TelegramForbiddenError:

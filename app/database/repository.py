@@ -670,6 +670,38 @@ class RealEstateRepository:
         )
         return list(result.scalars().all())
 
+    async def get_owner_history_chronological(
+        self, object_key: str, limit: int = 50
+    ) -> List[RealEstateOwnerHistory]:
+        """Return the owner history for an object, oldest first."""
+        result = await self.session.execute(
+            select(RealEstateOwnerHistory)
+            .where(RealEstateOwnerHistory.object_key == object_key)
+            .order_by(RealEstateOwnerHistory.recorded_at.asc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def get_ownership_duration(
+        self, object_key: str, owner_name: str, at_time: datetime
+    ) -> Optional[timedelta]:
+        """
+        How long did *owner_name* hold this object before *at_time*?
+        Returns None if owner_name never appears in the history.
+        """
+        history = await self.get_owner_history_chronological(object_key, limit=100)
+        if not history:
+            return None
+        # Find the first time this owner appears
+        acquired = None
+        for h in history:
+            if h.owner_name == owner_name:
+                acquired = h.recorded_at
+                break
+        if acquired is None:
+            return None
+        return at_time - acquired
+
     # ---- Building aggregates ----
 
     async def upsert_building(self, building_key: str, data: Dict[str, Any]) -> RealEstateBuildingState:

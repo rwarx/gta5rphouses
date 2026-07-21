@@ -5,6 +5,7 @@ import pytest
 from app.database.repository import (
     ApartmentRepository,
     ChangeRepository,
+    RealEstateRepository,
     ScraperSettingsRepository,
 )
 
@@ -73,3 +74,55 @@ async def test_scraper_settings_get_set(session):
     await repo.set("notify_free_found", "0")
     await session.commit()
     assert await repo.get("notify_free_found") == "0"
+
+
+@pytest.mark.asyncio
+async def test_owner_history_chronological_order(session):
+    from datetime import datetime, timezone, timedelta
+    repo = RealEstateRepository(session)
+    key = repo.make_key("20", "house", 1)
+    now = datetime.now(timezone.utc)
+    await repo.add_owner_history(key, "20", "house", "Alice", None, False)
+    await repo.add_owner_history(key, "20", "house", "Bob", "Alice", False)
+    await repo.add_owner_history(key, "20", "house", "Carol", "Bob", True)
+    await session.commit()
+
+    hist = await repo.get_owner_history_chronological(key, limit=10)
+    assert len(hist) == 3
+    assert hist[0].owner_name == "Alice"
+    assert hist[1].owner_name == "Bob"
+    assert hist[2].owner_name == "Carol"
+
+
+@pytest.mark.asyncio
+async def test_get_ownership_duration(session):
+    from datetime import datetime, timezone, timedelta
+    repo = RealEstateRepository(session)
+    key = repo.make_key("20", "house", 2)
+    now = datetime.now(timezone.utc)
+    then = now - timedelta(days=10)
+    # Manually set recorded_at to simulate past acquisition
+    h1 = await repo.add_owner_history(key, "20", "house", "Alice", None, False)
+    h1.recorded_at = then
+    await session.flush()
+
+    td = await repo.get_ownership_duration(key, "Alice", now)
+    assert td is not None
+    assert td.days >= 9  # approx 10 days
+
+
+@pytest.mark.asyncio
+async def test_get_ownership_duration_unknown_owner(session):
+    from datetime import datetime, timezone
+    repo = RealEstateRepository(session)
+    key = repo.make_key("20", "house", 3)
+    td = await repo.get_ownership_duration(key, "Ghost", datetime.now(timezone.utc))
+    assert td is None
+
+
+@pytest.mark.asyncio
+async def test_get_ownership_duration_no_history(session):
+    from datetime import datetime, timezone
+    repo = RealEstateRepository(session)
+    td = await repo.get_ownership_duration("20:house:999", "Alice", datetime.now(timezone.utc))
+    assert td is None

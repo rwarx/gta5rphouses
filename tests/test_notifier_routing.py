@@ -1,9 +1,10 @@
 """Tests for subscription-aware notification routing in ChangeNotifier."""
 
 import pytest
+from datetime import timedelta
 
 from app.database.repository import SubscriptionRepository
-from app.telegram.notifier import ChangeNotifier
+from app.telegram.notifier import ChangeNotifier, format_duration
 
 
 def _make_notifier(allowed_users):
@@ -59,3 +60,45 @@ async def test_recipients_empty_when_no_sid(session):
     notifier = _make_notifier(allowed_users=[7])
     recipients = await notifier._recipients_for_server(session, None)
     assert recipients == []
+
+
+# ---- format_duration ----
+
+def test_format_duration_less_than_minute():
+    assert format_duration(timedelta(seconds=30)) == "менее минуты"
+
+
+def test_format_duration_minutes():
+    result = format_duration(timedelta(minutes=5))
+    assert "5" in result and "минут" in result
+
+
+def test_format_duration_hours():
+    result = format_duration(timedelta(hours=3, minutes=15))
+    assert "3" in result and "часа" in result
+
+
+def test_format_duration_days():
+    result = format_duration(timedelta(days=7, hours=2))
+    assert "7" in result and "дней" in result
+
+
+def test_format_duration_1_day():
+    result = format_duration(timedelta(days=1))
+    assert "1 день" in result
+
+
+def test_format_duration_2_days():
+    result = format_duration(timedelta(days=2, hours=5))
+    assert "2 дня" in result and "5 часов" in result
+
+
+# ---- _owner_history_kb ----
+
+def test_owner_history_kb_has_button():
+    notifier = _make_notifier(allowed_users=[1])
+    kb = notifier._owner_history_kb("20:house:42")
+    assert kb.inline_keyboard
+    btn = kb.inline_keyboard[0][0]
+    assert "📜 История владельцев" in btn.text
+    assert btn.callback_data == "hst:20:house:42"

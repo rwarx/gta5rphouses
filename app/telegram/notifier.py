@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 
 from loguru import logger
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.config import get_settings
 from app.database.session import DatabaseSession
@@ -104,6 +105,29 @@ def _suffix_variation(last1: str, last2: str) -> bool:
     if shorter in longer or longer in shorter:
         return True
     return False
+
+
+def format_duration(td: timedelta) -> str:
+    """Format a timedelta into a human-readable Russian string."""
+    total_seconds = int(td.total_seconds())
+    if total_seconds < 0:
+        total_seconds = 0
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    parts = []
+    if days > 0:
+        d_word = "день" if days == 1 else "дня" if 2 <= days <= 4 else "дней"
+        parts.append(f"{days} {d_word}")
+    if hours > 0:
+        h_word = "час" if hours == 1 else "часа" if 2 <= hours <= 4 else "часов"
+        parts.append(f"{hours} {h_word}")
+    if minutes > 0 and days == 0:
+        m_word = "минута" if minutes == 1 else "минуты" if 2 <= minutes <= 4 else "минут"
+        parts.append(f"{minutes} {m_word}")
+    if not parts:
+        return "менее минуты"
+    return " ".join(parts)
 
 
 class ChangeNotifier:
@@ -251,14 +275,25 @@ class ChangeNotifier:
                 recipients = await self._recipients_for_server(session, sid)
                 if not recipients:
                     continue
-                message = self._build_hourly_report(server_events, since, now, sid)
+                # Pre-compute ownership durations for possible freed events
+                durations = {}
+                for e in server_events:
+                    if e.event_type == "possibly_freed" and e.old_owner:
+                        td = await realestate_repo.get_ownership_duration(
+                            e.object_key, e.old_owner, e.detected_at
+                        )
+                        if td and td.total_seconds() > 0:
+                            durations[e.id] = format_duration(td)
+                message = self._build_hourly_report(server_events, since, now,
+                                                     sid, durations)
                 for user_id in recipients:
                     msg = await send_notification(self.bot, user_id, message)
                     if msg:
                         key = (user_id, msg.message_id)
                         self._pending_edits[key] = (msg.text, datetime.now(timezone.utc))
 
-    def _build_hourly_report(self, events, since, now, server_sid=None) -> str:
+    def _build_hourly_report(self, events, since, now, server_sid=None,
+                             ownership_durations: Optional[dict] = None) -> str:
         """Render the last hour of catalog events as one compact report."""
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
@@ -295,7 +330,10 @@ class ChangeNotifier:
             for e in real_possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 name = e.name or e.object_key
-                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
+                duration = ""
+                if ownership_durations and e.id in ownership_durations:
+                    duration = f" (владел {ownership_durations[e.id]})"
+                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}{duration}")
 
         return "\n".join(lines)
 
@@ -311,11 +349,16 @@ class ChangeNotifier:
             text, _ = self._pending_edits.pop(key, (None, None))
             if not text:
                 continue
-            new_text = text.replace(
+            new_text = text
+            new_text = new_text.replace(
                 "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
                 "🕐✅ <b>Точные данные</b>",
-            ).replace(
+            )
+            new_text = new_text.replace(
                 "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
+            )
+            new_text = new_text.replace(
+                " (данные уточняются)</b>", "</b>"
             )
             if new_text == text:
                 continue
@@ -651,11 +694,21 @@ class ChangeNotifier:
                     continue
 
                 message = self._build_realestate_message(event)
+                keyboard = self._owner_history_kb(event.object_key)
+                # Enrich with ownership duration for freed events
+                if event.event_type == "freed" and event.old_owner:
+                    td = await realestate_repo.get_ownership_duration(
+                        event.object_key, event.old_owner, event.detected_at
+                    )
+                    if td and td.total_seconds() > 0:
+                        dur_str = format_duration(td)
+                        message = self._build_realestate_message(event, dur_str)
                 recipients = await self._recipients_for_server(
                     session, event.server_sid, kind=event.kind
                 )
                 for user_id in recipients:
-                    await send_notification(self.bot, user_id, message)
+                    await send_notification(self.bot, user_id, message,
+                                            reply_markup=keyboard)
 
                 await realestate_repo.mark_event_notified(event.id)
 
@@ -663,7 +716,7 @@ class ChangeNotifier:
                 logger.error(f"Failed to process realestate event {event.id}: {e}")
                 continue
 
-    def _build_realestate_message(self, event) -> str:
+    def _build_realestate_message(self, event, old_owner_duration: Optional[str] = None) -> str:
         """Render a realestate event as a Telegram message."""
         kind_ru = "Дом" if event.kind == "house" else "Квартира"
         name = event.name or f"{kind_ru} #{event.object_key.split(':')[-1]}"
@@ -683,7 +736,8 @@ class ChangeNotifier:
             if event.price:
                 parts.append(f"💰 Цена: {event.price:,}".replace(",", " "))
             if event.old_owner:
-                parts.append(f"👤 Бывший владелец: {event.old_owner}")
+                dur_text = f" (владел {old_owner_duration})" if old_owner_duration else ""
+                parts.append(f"👤 Бывший владелец: {event.old_owner}{dur_text}")
             parts.append("\n⚡️ Можно покупать — успей первым!")
 
         elif event.event_type == "occupied":
@@ -701,6 +755,12 @@ class ChangeNotifier:
             parts.append(f"• Стало: {event.new_owner or '—'}")
 
         return "\n".join(parts)
+
+    def _owner_history_kb(self, object_key: str) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📜 История владельцев",
+                                 callback_data=f"hst:{object_key}"),
+        ]])
 
     def _format_timestamp(self, val: Optional[str]) -> str:
         """Convert any timestamp to readable 'DD.MM.YYYY HH:MM:SS'."""

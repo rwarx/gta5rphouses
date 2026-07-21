@@ -117,7 +117,7 @@ def test_build_payday_report_counts_houses_and_apartments():
 async def test_payday_report_fires_once_per_recompute(session, monkeypatch):
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -178,7 +178,7 @@ async def test_payday_report_waits_for_map_scrape(session, monkeypatch):
     """
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -233,7 +233,7 @@ async def test_payday_report_fires_when_no_map_marker(session, monkeypatch):
     """
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -274,7 +274,7 @@ async def test_payday_report_fires_when_no_map_marker(session, monkeypatch):
 async def test_payday_report_empty_when_nothing_freed(session, monkeypatch):
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -318,7 +318,7 @@ async def test_payday_report_empty_when_nothing_freed(session, monkeypatch):
 async def test_payday_report_respects_disable_toggle(session, monkeypatch):
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -385,7 +385,7 @@ async def test_freed_event_suppressed_during_payday_window(session, monkeypatch)
     instantly — the recompute-gated report is authoritative during churn."""
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 
@@ -410,7 +410,7 @@ async def test_freed_event_sent_instantly_outside_payday_window(session, monkeyp
     """Outside the Payday window a 'freed' event still pings instantly."""
     sent = []
 
-    async def _fake_send(bot, user_id, message):
+    async def _fake_send(bot, user_id, message, **kwargs):
         sent.append((user_id, message))
         return True
 

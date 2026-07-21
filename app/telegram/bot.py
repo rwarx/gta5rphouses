@@ -584,10 +584,17 @@ class ApartmentBot:
     # ---- Subscription helpers (use the REAL invoking user id) ----
 
     async def _do_subscribe(self, uid: int, sid: str, kind: str) -> None:
-        from app.database.repository import SubscriptionRepository
+        from app.database.repository import SubscriptionRepository, UserServerSelectionRepository
+        from app.scraper.realestate_client import sid_to_server_name
         async with DatabaseSession.get_session_context() as session:
             repo = SubscriptionRepository(session)
             await repo.subscribe(uid, sid, kind=kind)
+            # Ensure this server gets polled by the scheduler. Save it as the
+            # user's active selection so _refresh_servers (which unions all user
+            # selections) picks it up. This way subscribing to ANY wiki server
+            # immediately starts its catalog fetches.
+            sel_repo = UserServerSelectionRepository(session)
+            await sel_repo.set(uid, sid)
 
     async def _do_unsubscribe(self, uid: int, sid: str) -> None:
         from app.database.repository import SubscriptionRepository

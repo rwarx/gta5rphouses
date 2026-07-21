@@ -23,7 +23,7 @@ def _make_notifier(allowed_users):
     settings.telegram = tg
     notifier.settings = settings
     notifier.bot = None
-    notifier._pending_edits = {}
+    notifier._pending_final_reports = {}
     return notifier
 
 

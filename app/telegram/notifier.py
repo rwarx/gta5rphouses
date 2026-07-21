@@ -141,8 +141,6 @@ class ChangeNotifier:
     # the map scrape lands seconds-to-minutes later; this bounds that wait so a
     # broken/disabled scraper can never swallow a Payday summary forever.
     _MAP_WAIT_GRACE = timedelta(minutes=10)
-    _REPORT_FINALIZE_DELAY = timedelta(minutes=10)
-
     def __init__(self, bot: Bot):
         self.bot = bot
         self.settings = get_settings()
@@ -157,8 +155,10 @@ class ChangeNotifier:
         # by "<sid>:<marker>". Drives the bounded grace period in _map_caught_up
         # so a never-arriving map scrape still lets the report out eventually.
         self._map_wait_since: dict = {}
-        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (since, until, sent_at, server_sid)
-        self._pending_edits: dict = {}
+        # Pending second (final) hourly reports per server, set when the first
+        # report goes out at HH:01 and cleared when the map catches up.
+        # {server_sid: [(user_id, since, until), ...]}
+        self._pending_final_reports: Dict[str, list] = {}
 
     def _in_payday_window(self) -> bool:
         """Whether the current minute falls inside the configured Payday window.
@@ -218,23 +218,19 @@ class ChangeNotifier:
                 await self._process_pending_notifications()
                 await self._maybe_send_hourly_report()
                 await self._maybe_send_payday_report()
-                await self._edit_expired_reports()
+                await self._check_pending_finals()
                 await asyncio.sleep(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Notification loop error: {e}")
                 await asyncio.sleep(10)
 
     async def _maybe_send_hourly_report(self) -> None:
-        """Once per clock hour, send a single compact Payday summary.
+        """Once per clock hour, send a quick report (HH:01).
 
-        Instead of spamming one message per catalog change during Payday, we
-        roll the last hour of events into one report: how many houses/apartments
-        freed, and how many owner-nickname changes (possible silent free-ups)
-        were seen.
+        A second, final report is sent later when the wiki recompute catches up
+        (see ``_check_pending_finals`` / ``_maybe_send_payday_report``).
         """
         now = datetime.now(timezone.utc)
-        # Wait until at least 1 minute past the hour so the map has a chance
-        # to update after the catalog recompute.
         if now.minute < 1:
             return
 
@@ -242,8 +238,6 @@ class ChangeNotifier:
         if self._last_report_hour == hour_key:
             return
 
-        # On the very first loop iteration just latch the current hour; don't
-        # fire a report immediately on startup.
         if self._last_report_hour is None:
             self._last_report_hour = hour_key
             return
@@ -262,9 +256,6 @@ class ChangeNotifier:
             since = now - timedelta(hours=1)
             events = await realestate_repo.get_events_since(since)
 
-            # Group the hour's events by server so each server's subscribers get
-            # a report scoped to their server. Servers with no events this hour
-            # still get a short "no changes" report if someone is subscribed.
             monitored = self.settings.realestate.server_names
             monitored_sids = [
                 sid for sid in (
@@ -280,7 +271,6 @@ class ChangeNotifier:
                 recipients = await self._recipients_for_server(session, sid)
                 if not recipients:
                     continue
-                # Pre-compute ownership durations for possible freed events
                 durations = {}
                 for e in server_events:
                     if e.event_type == "possibly_freed" and e.old_owner:
@@ -292,10 +282,11 @@ class ChangeNotifier:
                 message = self._build_hourly_report(server_events, since, now,
                                                      sid, durations)
                 for user_id in recipients:
-                    msg = await send_notification(self.bot, user_id, message)
-                    if msg:
-                        key = (user_id, msg.message_id)
-                        self._pending_edits[key] = (since, now, datetime.now(timezone.utc), sid)
+                    await send_notification(self.bot, user_id, message)
+                    # Store pending final report for this server
+                    self._pending_final_reports.setdefault(sid, []).append(
+                        (user_id, since, now)
+                    )
 
     def _build_hourly_report(self, events, since, now, server_sid=None,
                              ownership_durations: Optional[dict] = None) -> str:
@@ -312,9 +303,9 @@ class ChangeNotifier:
 
         period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
         server = sid_to_server_name(server_sid) if server_sid else None
-        header = "🕐 <b>Быстрый отчёт (данные уточняются)</b>"
+        header = "🕐 <b>Быстрый отчёт</b>"
         if server:
-            header = f"🕐 <b>Быстрый отчёт — {server} (данные уточняются)</b>"
+            header = f"🕐 <b>Быстрый отчёт — {server}</b>"
         lines = [
             header,
             f"<i>{period}</i>",
@@ -342,17 +333,23 @@ class ChangeNotifier:
 
         return "\n".join(lines)
 
-    async def _edit_expired_reports(self) -> None:
-        """Edit hourly reports sent as "быстрый отчёт" → rebuild content + "точные данные"."""
-        now = datetime.now(timezone.utc)
-        expired = [
-            key for key, (_, _, sent_at, _) in self._pending_edits.items()
-            if now - sent_at >= self._REPORT_FINALIZE_DELAY
-        ]
-        for chat_id, msg_id in expired:
-            key = (chat_id, msg_id)
-            since, until, _, _ = self._pending_edits.pop(key)
-            await self._rebuild_and_edit_report(chat_id, msg_id, since, until)
+    async def _check_pending_finals(self) -> None:
+        """Send final (точные данные) reports for servers whose map caught up."""
+        if not self._pending_final_reports:
+            return
+        async with DatabaseSession.get_session_context() as session:
+            settings_repo = ScraperSettingsRepository(session)
+            for sid in list(self._pending_final_reports):
+                marker = await settings_repo.get(f"catalog_recompute:{sid}")
+                if marker is None:
+                    continue
+                if not await self._map_caught_up(settings_repo, sid, marker):
+                    continue
+                pending = self._pending_final_reports.pop(sid, [])
+                recipients = await self._recipients_for_server(session, sid)
+                for user_id, since, until in pending:
+                    if user_id in recipients:
+                        await self._send_final_report(user_id, since, until, sid)
 
     async def _map_caught_up(self, settings_repo, sid: str, catalog_marker: str) -> bool:
         """Whether the browser map scrape has caught up to this catalog recompute.
@@ -540,44 +537,65 @@ class ChangeNotifier:
     async def _finalise_hourly_for_server(
         self, session, server_sid: str, recipients: List[int]
     ) -> None:
-        """Edit pending hourly reports for a server that just got Payday data."""
-        now = datetime.now(timezone.utc)
-        hands: List[tuple] = []
-        for (cid, mid), val in list(self._pending_edits.items()):
-            since, until, sent_at, sv = val
-            if sv != server_sid or cid not in recipients:
-                continue
-            hands.append((cid, mid, since, until))
-        for cid, mid, since, until in hands:
-            key = (cid, mid)
-            self._pending_edits.pop(key, None)
-            await self._rebuild_and_edit_report(cid, mid, since, until)
+        """Send final reports for a server (triggered by Payday map update)."""
+        pending = self._pending_final_reports.pop(server_sid, [])
+        for user_id, since, until in pending:
+            if user_id in recipients:
+                await self._send_final_report(user_id, since, until, server_sid)
 
-    async def _rebuild_and_edit_report(
-        self, chat_id: int, msg_id: int, since: datetime, until: datetime
+    async def _send_final_report(
+        self, user_id: int, since: datetime, until: datetime, server_sid: str
     ) -> None:
-        """Re-query events for a time window and edit the message in place."""
+        """Re-query events and send a new «🕐✅ Точные данные» message."""
         try:
             async with DatabaseSession.get_session_context() as session:
                 repo = RealEstateRepository(session)
-                events = await repo.get_events_since(since, until=until)
-                message = self._build_hourly_report(events, since, until)
-                message = message.replace(
-                    "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
-                    "🕐✅ <b>Точные данные</b>",
-                ).replace(
-                    "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
-                ).replace(
-                    " (данные уточняются)</b>", "</b>"
-                )
-                await self.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=message,
-                    parse_mode="HTML",
-                )
+                events = await repo.get_events_since(since, until=until, server_sid=server_sid)
+                now = datetime.now(timezone.utc)
+            message = self._build_final_report(events, since, now, server_sid)
+            await send_notification(self.bot, user_id, message)
         except Exception as e:
-            logger.debug(f"Failed to edit report {chat_id}/{msg_id}: {e}")
+            logger.debug(f"Failed to send final report for {user_id}: {e}")
+
+    def _build_final_report(self, events, since, now, server_sid=None) -> str:
+        """Build «🕐✅ Точные данные» report with accurate data."""
+        freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
+        freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
+        possibly = [e for e in events if e.event_type == "possibly_freed"]
+        real_possibly = [
+            e for e in possibly
+            if not _is_nickname_change(e.old_owner, e.new_owner)
+        ]
+        nick_changes = len(possibly) - len(real_possibly)
+
+        period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
+        server = sid_to_server_name(server_sid) if server_sid else None
+        header = "🕐✅ <b>Точные данные</b>"
+        if server:
+            header = f"🕐✅ <b>Точные данные — {server}</b>"
+        lines = [
+            header,
+            f"<i>{period}</i>",
+            "━━━━━━━━━━━━━━━",
+            f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
+            f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>",
+            f"🔄 Смен ников (возможные слёты): <b>{len(real_possibly)}</b>",
+        ]
+        if nick_changes:
+            lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
+
+        if not events:
+            lines.append("\n<i>За этот час изменений не было.</i>")
+            return "\n".join(lines)
+
+        if real_possibly:
+            lines.append("\n<b>Возможные слёты:</b>")
+            for e in real_possibly:
+                kind_ru = "дом" if e.kind == "house" else "кв."
+                name = e.name or e.object_key
+                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
+
+        return "\n".join(lines)
 
     def _build_payday_report(self, events, server_sid=None) -> str:
         """Render the freed houses + apartments of one Payday as a report.

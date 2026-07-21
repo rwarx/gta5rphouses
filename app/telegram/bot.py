@@ -951,6 +951,7 @@ class ApartmentBot:
         apts = [o for o in objs if o.kind == "apartment"]
 
         lines = []
+        kb_rows = []
         if houses:
             lines.append("<b>🏠 Дома</b>")
             for o in sorted(houses, key=lambda x: x.unit_id):
@@ -961,6 +962,8 @@ class ApartmentBot:
                     + garage
                     + f" · 👤 {o.owner_name}"
                 )
+                key = repo.make_key(sid, o.kind, o.unit_id)
+                kb_rows.append([self._btn(f"📜 ID #{o.unit_id}", f"hst:{key}")])
         if apts:
             if houses:
                 lines.append("")
@@ -974,12 +977,16 @@ class ApartmentBot:
                     + garage
                     + f" · 👤 {o.owner_name}"
                 )
+                key = repo.make_key(sid, o.kind, o.unit_id)
+                kb_rows.append([self._btn(f"📜 ID #{o.unit_id}", f"hst:{key}")])
 
         header = (
             f"<b>👤 Объекты игрока «{query}» · {server_name}</b>\n"
             f"🏠 Домов: {len(houses)} · 🏢 Квартир: {len(apts)}\n\n"
         )
-        await self._reply_chunked(message, lines, header, footer_kb=self._back_kb("catalog"))
+        kb_rows.append([self._btn("⬅️ В меню", "menu:catalog")])
+        markup = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        await self._reply_chunked(message, lines, header, footer_kb=markup)
 
     # ---- Per-server notification subscriptions ----
 

@@ -708,7 +708,7 @@ class RealEstateRepository:
         building_name: Optional[str] = None,
         class_name: Optional[str] = None,
         search: Optional[str] = None,
-        limit: int = 500,
+        limit: int = 2000,
     ) -> List[RealEstateObject]:
         """List currently-occupied objects with optional filters, for the catalog."""
         conditions = [

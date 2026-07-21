@@ -106,6 +106,7 @@ class ApartmentBot:
         self.dp.message.register(self.cmd_owner_history, Command("owner_history"))
         self.dp.message.register(self.cmd_possibly_notify, Command("possibly_notify"))
         self.dp.message.register(self.cmd_report, Command("report"))
+        self.dp.message.register(self.cmd_last_data, Command("last_data"))
         self.dp.message.register(self.cmd_servers, Command("servers"))
         self.dp.message.register(self.cmd_subscribe, Command("subscribe"))
         self.dp.message.register(self.cmd_unsubscribe, Command("unsubscribe"))
@@ -214,7 +215,10 @@ class ApartmentBot:
                 [b("⬅️ Назад", "menu:main")],
             ]
         elif section == "reports":
-            rows = [[b("🕐 Отчёт сейчас", "act:report_now")]]
+            rows = [
+                [b("🕐 Отчёт сейчас", "act:report_now")],
+                [b("📊 Последние данные", "act:latest_data")],
+            ]
             if self._is_admin(uid):
                 rows.append([b("🔔 Авто-отчёт (вкл/выкл)", "adm:report_toggle")])
                 rows.append([b("🏛 Гос-отчёт за пейдей (вкл/выкл)", "adm:payday_toggle")])
@@ -331,7 +335,32 @@ class ApartmentBot:
             from app.scraper.realestate_client import sid_to_server_name
             await self._set_user_sid(uid, sid)
             name = sid_to_server_name(sid) or f"sid {sid}"
-            await query.answer(f"🌐 Сервер: {name}")
+            await query.answer(f"🌐 Сервер: {name}, загружаю данные...")
+            # Immediately fetch catalog data for the selected server
+            try:
+                from app.scraper.realestate_client import RealEstateClient
+                from app.scraper.realestate_detector import RealEstateDetector
+                client = RealEstateClient()
+                snapshot = await client.fetch_snapshot(sid)
+                if snapshot and (snapshot.houses or snapshot.apartments or snapshot.buildings):
+                    async with DatabaseSession.get_session_context() as session:
+                        detector = RealEstateDetector(session)
+                        await detector.process_snapshot(snapshot, is_payday=False)
+                    await query.message.answer(
+                        f"✅ Данные сервера <b>{name}</b> загружены:\n"
+                        f"🏠 Домов: {len(snapshot.houses)} | "
+                        f"🏢 Квартир: {len(snapshot.apartments)} | "
+                        f"🏘 Зданий: {len(snapshot.buildings)}",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await query.message.answer(
+                        f"⚠️ Данные для сервера {name} пока недоступны. "
+                        "Каталог обновится автоматически в ближайшее время."
+                    )
+            except Exception as e:
+                from loguru import logger
+                logger.warning(f"Immediate fetch for {name} failed: {e}")
             await self._edit_menu(
                 query,
                 self._MENU_TEXT["main"] + f"\n\n<i>Активный сервер: {name}</i>",
@@ -422,6 +451,7 @@ class ApartmentBot:
             "servers": self.cmd_servers,
             "help": self.cmd_help,
             "report_now": self._report_now,
+            "latest_data": self._latest_data,
         }
         handler = handlers.get(action)
         if handler:
@@ -785,8 +815,9 @@ class ApartmentBot:
         lines = []
         for u in units:
             cls = f" · 🏷 {u.class_name}" if u.class_name else ""
+            garage = f" · 🚗 {u.vehicle_count}гм" if u.vehicle_count else ""
             lines.append(
-                f"🔴 {u.name or ('#' + str(u.unit_id))} · ID #{u.unit_id}{cls}\n"
+                f"🔴 {u.name or ('#' + str(u.unit_id))} · ID #{u.unit_id}{cls}{garage}\n"
                 f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
             )
         header = f"<b>🏢 {building_name} · {server_name}</b>\nЗанятых квартир: {len(units)}\n\n"
@@ -812,7 +843,7 @@ class ApartmentBot:
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
             houses = await repo.list_occupied(
-                sid, kind="house", search=query or None, limit=300
+                sid, kind="house", search=query or None, limit=1000
             )
 
         if not houses:
@@ -826,14 +857,14 @@ class ApartmentBot:
         lines = []
         for u in houses:
             cls = f" · {u.class_name}" if u.class_name else ""
+            if u.vehicle_count:
+                cls += f" · 🚗 {u.vehicle_count}гм"
             lines.append(
                 f"🔴 {u.name or ('Дом #' + str(u.unit_id))}{cls}\n"
                 f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
             )
         title = f"поиск «{query}»" if query else "все занятые"
         header = f"<b>🏠 Дома · {server_name} · {title}</b>\nНайдено: {len(houses)}\n\n"
-        if not query and len(houses) >= 300:
-            header += "<i>Показаны первые 300. Уточните: /houses &lt;текст&gt;</i>\n\n"
         await self._reply_chunked(message, lines, header, footer_kb=self._back_kb("catalog"))
 
     async def cmd_owners(self, message: Message) -> None:
@@ -878,9 +909,11 @@ class ApartmentBot:
         if houses:
             lines.append("<b>🏠 Дома</b>")
             for o in sorted(houses, key=lambda x: x.unit_id):
+                garage = f" · 🚗 {o.vehicle_count}гм" if o.vehicle_count else ""
                 lines.append(
                     f"• ID #{o.unit_id} · 💰 {self._fmt_price(o.price)}"
                     + (f" · 🏷 {o.class_name}" if o.class_name else "")
+                    + garage
                     + f" · 👤 {o.owner_name}"
                 )
         if apts:
@@ -889,9 +922,11 @@ class ApartmentBot:
             lines.append("<b>🏢 Квартиры</b>")
             for o in sorted(apts, key=lambda x: (x.building_name or "", x.unit_id)):
                 where = f" · {o.building_name}" if o.building_name else ""
+                garage = f" · 🚗 {o.vehicle_count}гм" if o.vehicle_count else ""
                 lines.append(
                     f"• ID #{o.unit_id}{where} · 💰 {self._fmt_price(o.price)}"
                     + (f" · 🏷 {o.class_name}" if o.class_name else "")
+                    + garage
                     + f" · 👤 {o.owner_name}"
                 )
 
@@ -1095,6 +1130,10 @@ class ApartmentBot:
             f"Уведомления о «возможных слётах» (смена ника в пейдей) {status}."
         )
 
+    async def cmd_last_data(self, message: Message) -> None:
+        """Send the latest Payday data for the user's active server."""
+        await self._latest_data(message, user_id=message.from_user.id)
+
     async def cmd_report(self, message: Message) -> None:
         """Send the last-hour Payday report now, or toggle the auto report.
 
@@ -1149,19 +1188,72 @@ class ApartmentBot:
         ]
         if possibly:
             lines.append("\n<b>Возможные слёты:</b>")
-            for e in possibly[:10]:
+            for e in possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 lines.append(
                     f"• {kind_ru} {e.name or e.object_key}: "
                     f"{e.old_owner or '—'} → {e.new_owner or '—'}"
                 )
-            if len(possibly) > 10:
-                lines.append(f"…и ещё {len(possibly) - 10}")
         elif not events:
             lines.append("\n<i>За этот час изменений не было.</i>")
 
         await message.answer("\n".join(lines), parse_mode="HTML",
                              reply_markup=self._back_kb("reports"))
+
+    async def _latest_data(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Send the latest Payday data for the user's active server."""
+        from datetime import datetime, timezone, timedelta
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+
+        uid = user_id or message.from_user.id
+        sid, server_name = await self._default_sid_for_user(uid)
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=6)
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            events = await repo.get_events_since(since, server_sid=sid)
+            buildings = await repo.get_buildings(sid)
+            occupied_houses = await repo.count_occupied(sid, kind="house")
+            occupied_apts = await repo.count_occupied(sid, kind="apartment")
+
+        freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
+        freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
+        possibly = [e for e in events if e.event_type == "possibly_freed"]
+
+        apt_total = sum((b.apartments_count or 0) for b in buildings)
+        apt_free = sum((b.free_count or 0) for b in buildings)
+
+        lines = [
+            f"📊 <b>Последние данные · {server_name}</b>",
+            f"<i>{now.strftime('%d.%m.%Y %H:%M')} UTC</i>",
+            "━━━━━━━━━━━━━━━",
+            f"🏢 Квартир всего: {apt_total}, свободно: {apt_free}",
+            f"🏠 Занятых домов: {occupied_houses}",
+            f"🏢 Занятых квартир: {occupied_apts}",
+            "━━━━━━━━━━━━━━━",
+            f"🏠 Слетело домов (за 6ч): <b>{len(freed_houses)}</b>",
+            f"🏢 Слетело квартир (за 6ч): <b>{len(freed_apts)}</b>",
+            f"🔄 Смен ников (за 6ч): <b>{len(possibly)}</b>",
+        ]
+
+        if freed_houses:
+            lines.append("\n<b>Слетевшие дома:</b>")
+            for e in freed_houses:
+                lines.append(f"• {e.name or '#' + str(e.unit_id)} ({e.class_name or '—'}) · 💰 {e.price or '—'}")
+        if freed_apts:
+            lines.append("\n<b>Слетевшие квартиры:</b>")
+            for e in freed_apts:
+                lines.append(f"• {e.name or '#' + str(e.unit_id)} · {e.building_name or '—'} · 💰 {e.price or '—'}")
+        if possibly:
+            lines.append("\n<b>Смены владельцев (возможные слёты):</b>")
+            for e in possibly:
+                kind_ru = "дом" if e.kind == "house" else "кв."
+                lines.append(f"• {kind_ru} {e.name or e.object_key}: {e.old_owner or '—'} → {e.new_owner or '—'}")
+
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("reports"))
 
     async def cmd_start(self, message: Message) -> None:
         uid = message.from_user.id
@@ -1238,7 +1330,7 @@ class ApartmentBot:
             "  /realestate — каталог освобождений\n"
             "  /buildings · /building <i>название</i> — здания и квартиры\n"
             "  /houses · /owners <i>ник</i> · /owner_history <i>ключ</i>\n"
-            "  /report [on|off] · /possibly_notify — отчёты\n"
+            "  /report [on|off] · /last_data — отчёты\n"
             "  /servers · /subscribe <i>сервер</i> [house|apartment]\n"
             "  /unsubscribe <i>сервер</i> · /subscriptions — подписки\n"
             "  /crashday · /last_update\n\n"

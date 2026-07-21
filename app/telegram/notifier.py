@@ -203,16 +203,12 @@ class ChangeNotifier:
             lines.append("\n<i>За этот час изменений не было.</i>")
             return "\n".join(lines)
 
-        # A short sample of the possibly-freed objects, so the report is
-        # actionable without flooding the chat.
         if possibly:
             lines.append("\n<b>Возможные слёты:</b>")
-            for e in possibly[:10]:
+            for e in possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 name = e.name or e.object_key
                 lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
-            if len(possibly) > 10:
-                lines.append(f"…и ещё {len(possibly) - 10}")
 
         return "\n".join(lines)
 
@@ -434,14 +430,10 @@ class ChangeNotifier:
 
         if freed_houses:
             lines.append("\n<b>🏠 Дома:</b>")
-            lines.extend(_fmt(e) for e in freed_houses[:20])
-            if len(freed_houses) > 20:
-                lines.append(f"…и ещё {len(freed_houses) - 20}")
+            lines.extend(_fmt(e) for e in freed_houses)
         if freed_apts:
             lines.append("\n<b>🏢 Квартиры:</b>")
-            lines.extend(_fmt(e) for e in freed_apts[:20])
-            if len(freed_apts) > 20:
-                lines.append(f"…и ещё {len(freed_apts) - 20}")
+            lines.extend(_fmt(e) for e in freed_apts)
 
         return "\n".join(lines)
 

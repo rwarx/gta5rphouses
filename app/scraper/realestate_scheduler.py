@@ -150,8 +150,11 @@ class RealEstateScheduler:
         if not smart.smart_mode:
             return rs.interval
 
-        # Inside Payday poll as fast as the map scraper does, but never below 5s.
-        return max(smart.high_interval, 5) if self._in_payday_window() else rs.interval
+        # Inside Payday: poll every 3s to catch the catalog recompute
+        # the moment it happens (wiki can update 0-15 min past the hour).
+        if self._in_payday_window():
+            return max(smart.high_interval, 3)
+        return rs.interval
 
     async def force_fetch(self) -> int:
         """Run one fetch/diff cycle immediately; return the number of changes."""

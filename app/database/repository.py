@@ -613,6 +613,7 @@ class RealEstateRepository:
     async def get_events_since(
         self,
         since: datetime,
+        until: Optional[datetime] = None,
         event_types: Optional[List[str]] = None,
         server_sid: Optional[str] = None,
     ) -> List[RealEstateEvent]:
@@ -623,6 +624,8 @@ class RealEstateRepository:
         `server_sid` scopes the result to a single server.
         """
         conditions = [RealEstateEvent.detected_at >= since]
+        if until:
+            conditions.append(RealEstateEvent.detected_at <= until)
         if event_types:
             conditions.append(RealEstateEvent.event_type.in_(event_types))
         if server_sid:

@@ -157,7 +157,7 @@ class ChangeNotifier:
         # by "<sid>:<marker>". Drives the bounded grace period in _map_caught_up
         # so a never-arriving map scrape still lets the report out eventually.
         self._map_wait_since: dict = {}
-        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (text, sent_at)
+        # Sent hourly reports awaiting finalisation: (chat_id, message_id) -> (since, until, sent_at)
         self._pending_edits: dict = {}
 
     def _in_payday_window(self) -> bool:
@@ -233,6 +233,11 @@ class ChangeNotifier:
         were seen.
         """
         now = datetime.now(timezone.utc)
+        # Wait until at least 1 minute past the hour so the map has a chance
+        # to update after the catalog recompute.
+        if now.minute < 1:
+            return
+
         hour_key = now.strftime("%Y-%m-%d-%H")
         if self._last_report_hour == hour_key:
             return
@@ -290,7 +295,7 @@ class ChangeNotifier:
                     msg = await send_notification(self.bot, user_id, message)
                     if msg:
                         key = (user_id, msg.message_id)
-                        self._pending_edits[key] = (msg.text, datetime.now(timezone.utc))
+                        self._pending_edits[key] = (since, now, datetime.now(timezone.utc))
 
     def _build_hourly_report(self, events, since, now, server_sid=None,
                              ownership_durations: Optional[dict] = None) -> str:
@@ -338,37 +343,34 @@ class ChangeNotifier:
         return "\n".join(lines)
 
     async def _edit_expired_reports(self) -> None:
-        """Edit hourly reports that were sent as "быстрый отчёт" to "данные уточнены"."""
+        """Edit hourly reports sent as "быстрый отчёт" → rebuild content + "точные данные"."""
         now = datetime.now(timezone.utc)
         expired = [
-            key for key, (_, sent_at) in self._pending_edits.items()
+            key for key, (_, _, sent_at) in self._pending_edits.items()
             if now - sent_at >= self._REPORT_FINALIZE_DELAY
         ]
         for chat_id, msg_id in expired:
             key = (chat_id, msg_id)
-            text, _ = self._pending_edits.pop(key, (None, None))
-            if not text:
-                continue
-            new_text = text
-            new_text = new_text.replace(
-                "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
-                "🕐✅ <b>Точные данные</b>",
-            )
-            new_text = new_text.replace(
-                "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
-            )
-            new_text = new_text.replace(
-                " (данные уточняются)</b>", "</b>"
-            )
-            if new_text == text:
-                continue
+            since, until, _ = self._pending_edits.pop(key)
             try:
-                await self.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=new_text,
-                    parse_mode="HTML",
-                )
+                async with DatabaseSession.get_session_context() as session:
+                    repo = RealEstateRepository(session)
+                    events = await repo.get_events_since(since, until=until)
+                    message = self._build_hourly_report(events, since, until)
+                    message = message.replace(
+                        "🕐 <b>Быстрый отчёт (данные уточняются)</b>",
+                        "🕐✅ <b>Точные данные</b>",
+                    ).replace(
+                        "🕐 <b>Быстрый отчёт — ", "🕐✅ <b>Точные данные — "
+                    ).replace(
+                        " (данные уточняются)</b>", "</b>"
+                    )
+                    await self.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=message,
+                        parse_mode="HTML",
+                    )
             except Exception as e:
                 logger.debug(f"Failed to edit report for {chat_id}: {e}")
 

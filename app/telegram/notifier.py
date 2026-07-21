@@ -4,6 +4,7 @@ Monitors detected changes and sends notifications to admin users.
 """
 
 import asyncio
+import re
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 
@@ -21,6 +22,88 @@ from app.database.repository import (
 )
 from app.scraper.realestate_client import sid_to_server_name, server_name_to_sid
 from app.telegram.bot import send_notification
+
+
+def _is_nickname_change(old_owner: Optional[str], new_owner: Optional[str]) -> bool:
+    """Detect if an owner change is just a RP nickname change (family/mafia rename).
+
+    GTA RP players change surnames when joining families, adding suffixes like
+    ov/ev/in/sky/skiy/ian/yan/ents/unts (male) or ova/eva/ina/skaya (female).
+    The object is still owned by the same player — no free-up happened.
+    """
+    if not old_owner or not new_owner:
+        return False
+
+    def _parts(name: str) -> tuple:
+        name = name.strip().replace("_", " ").lower()
+        parts = name.split()
+        first = parts[0] if parts else ""
+        last = " ".join(parts[1:]) if len(parts) > 1 else ""
+        return first, last
+
+    f1, l1 = _parts(old_owner)
+    f2, l2 = _parts(new_owner)
+
+    if not f1 or not f2:
+        return False
+
+    # Same first name → same character, just changed family name
+    if f1 == f2:
+        return True
+
+    # Same last name → likely a character rename (first name changed)
+    if l1 and l2 and l1 == l2:
+        return True
+
+    # First name differs by 1 character (typo / slight rename)
+    if abs(len(f1) - len(f2)) <= 1 and _levenshtein(f1, f2) <= 1:
+        return True
+
+    # Last name changed only by adding/removing a suffix
+    if l1 and l2 and _suffix_variation(l1, l2):
+        return True
+
+    return False
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Simple Levenshtein distance for short strings."""
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+_SUFFIXES = {
+    "ov", "ev", "in", "sky", "skiy", "tskiy",
+    "ova", "eva", "ina", "skaya",
+    "ian", "yan", "ents", "unts", "ez", "ovv", "off",
+}
+
+
+def _suffix_variation(last1: str, last2: str) -> bool:
+    """Check if two last names differ only by a known family suffix."""
+    if last1 == last2:
+        return True
+    longer, shorter = (last1, last2) if len(last1) >= len(last2) else (last2, last1)
+    # Strip suffixes from the longer one and compare to the shorter
+    for suf in _SUFFIXES:
+        if longer.endswith(suf):
+            base = longer[: -len(suf)]
+            if base == shorter:
+                return True
+    # Also check if one is a substring of the other (e.g. Geekez → Geek)
+    if shorter in longer or longer in shorter:
+        return True
+    return False
 
 
 class ChangeNotifier:
@@ -180,6 +263,12 @@ class ChangeNotifier:
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
         possibly = [e for e in events if e.event_type == "possibly_freed"]
+        # Filter out nickname changes from "possible freed" list
+        real_possibly = [
+            e for e in possibly
+            if not _is_nickname_change(e.old_owner, e.new_owner)
+        ]
+        nick_changes = len(possibly) - len(real_possibly)
 
         period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
         server = sid_to_server_name(server_sid) if server_sid else None
@@ -192,16 +281,18 @@ class ChangeNotifier:
             "━━━━━━━━━━━━━━━",
             f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
             f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>",
-            f"🔄 Смен ников (возможные слёты): <b>{len(possibly)}</b>",
+            f"🔄 Смен ников (возможные слёты): <b>{len(real_possibly)}</b>",
         ]
+        if nick_changes:
+            lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
 
         if not events:
             lines.append("\n<i>За этот час изменений не было.</i>")
             return "\n".join(lines)
 
-        if possibly:
+        if real_possibly:
             lines.append("\n<b>Возможные слёты:</b>")
-            for e in possibly:
+            for e in real_possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 name = e.name or e.object_key
                 lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")

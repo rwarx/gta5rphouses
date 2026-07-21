@@ -1211,9 +1211,12 @@ class ApartmentBot:
             repo = RealEstateRepository(session)
             events = await repo.get_events_since(since)
 
+        from app.telegram.notifier import _is_nickname_change
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
         possibly = [e for e in events if e.event_type == "possibly_freed"]
+        real_possibly = [e for e in possibly if not _is_nickname_change(e.old_owner, e.new_owner)]
+        nick_changes = len(possibly) - len(real_possibly)
 
         period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
         lines = [
@@ -1222,9 +1225,11 @@ class ApartmentBot:
             "━━━━━━━━━━━━━━━",
             f"🏠 Слетело домов: <b>{len(freed_houses)}</b>",
             f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>",
-            f"🔄 Смен ников (возможные слёты): <b>{len(possibly)}</b>",
+            f"🔄 Смен ников (возможные слёты): <b>{len(real_possibly)}</b>",
         ]
-        if possibly:
+        if nick_changes:
+            lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
+        if real_possibly:
             lines.append("\n<b>Возможные слёты:</b>")
             for e in possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
@@ -1256,9 +1261,12 @@ class ApartmentBot:
             occupied_houses = await repo.count_occupied(sid, kind="house")
             occupied_apts = await repo.count_occupied(sid, kind="apartment")
 
+        from app.telegram.notifier import _is_nickname_change
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
         possibly = [e for e in events if e.event_type == "possibly_freed"]
+        real_possibly = [e for e in possibly if not _is_nickname_change(e.old_owner, e.new_owner)]
+        nick_changes = len(possibly) - len(real_possibly)
 
         apt_total = sum((b.apartments_count or 0) for b in buildings)
         apt_free = sum((b.free_count or 0) for b in buildings)
@@ -1273,8 +1281,10 @@ class ApartmentBot:
             "━━━━━━━━━━━━━━━",
             f"🏠 Слетело домов (за 6ч): <b>{len(freed_houses)}</b>",
             f"🏢 Слетело квартир (за 6ч): <b>{len(freed_apts)}</b>",
-            f"🔄 Смен ников (за 6ч): <b>{len(possibly)}</b>",
+            f"🔄 Смен ников (за 6ч): <b>{len(real_possibly)}</b>",
         ]
+        if nick_changes:
+            lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
 
         if freed_houses:
             lines.append("\n<b>Слетевшие дома:</b>")
@@ -1284,7 +1294,7 @@ class ApartmentBot:
             lines.append("\n<b>Слетевшие квартиры:</b>")
             for e in freed_apts:
                 lines.append(f"• {e.name or '#' + str(e.unit_id)} · {e.building_name or '—'} · 💰 {e.price or '—'}")
-        if possibly:
+        if real_possibly:
             lines.append("\n<b>Смены владельцев (возможные слёты):</b>")
             for e in possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."

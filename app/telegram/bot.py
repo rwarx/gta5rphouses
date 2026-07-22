@@ -929,7 +929,7 @@ class ApartmentBot:
                                   footer_kb=self._back_kb("catalog"))
 
     async def cmd_possible_frees(self, message: Message, user_id: Optional[int] = None) -> None:
-        """Show recently freed objects that may free again."""
+        """Show objects at risk of freeing based on ownership duration."""
         uid = user_id or message.from_user.id
         d_sid, d_name = await self._default_sid_for_user(uid)
         if not d_sid:
@@ -941,54 +941,52 @@ class ApartmentBot:
                                      server_name: str) -> None:
         from app.database.repository import RealEstateRepository
         from app.scraper.realestate_client import sid_to_server_name
-        from app.services.tax import format_tax
+        from app.telegram.notifier import format_duration
 
         server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
-            events = await repo.get_possible_frees(sid, hours=48)
+            rows = await repo.get_all_current_ownership_durations(sid)
 
-        if not events:
-            await message.answer(
-                "✅ За последние 48 часов освобождений не было.",
-                reply_markup=self._back_kb("catalog"),
-            )
+        if not rows:
+            await message.answer("⏱ Нет данных о времени владения.",
+                                 reply_markup=self._back_kb("catalog"))
             return
 
-        houses = [e for e in events if e.kind == "house"]
-        apts = [e for e in events if e.kind == "apartment"]
+        houses = [r for r in rows if r["kind"] == "house"]
+        apts = [r for r in rows if r["kind"] == "apartment"]
 
         lines = []
-        if houses:
-            lines.append("<b>🏠 Дома</b>")
-            for e in houses:
-                when = e.detected_at.strftime("%d.%m %H:%M")
-                price = self._fmt_price(e.price) if e.price else "—"
-                cls = f" · 🏷 {e.class_name}" if e.class_name else ""
-                oo = f" 👤 {e.old_owner}" if e.old_owner else ""
-                lines.append(
-                    f"🟢 ID #{e.object_key.split(':')[-1]} · 💰 {price}{cls}\n"
-                    f"    ⏱ {when}{oo}"
-                )
-        if apts:
-            if houses:
+        # — risk groups —
+        for label, kind, items in [("🏠 Дома", "house", houses),
+                                   ("🏢 Квартиры", "apartment", apts)]:
+            if not items:
+                continue
+            if lines:
                 lines.append("")
-            lines.append("<b>🏢 Квартиры</b>")
-            for e in sorted(apts, key=lambda x: (x.building_name or "", x.unit_id)):
-                when = e.detected_at.strftime("%d.%m %H:%M")
-                price = self._fmt_price(e.price) if e.price else "—"
-                where = f" · {e.building_name}" if e.building_name else ""
-                tax_str = f" · {format_tax(e.class_name)}" if e.class_name else ""
-                oo = f" 👤 {e.old_owner}" if e.old_owner else ""
+            lines.append(f"<b>{label}</b>")
+            for r in sorted(items, key=lambda x: (x["duration"] or timedelta()).total_seconds()):
+                dur = r["duration"]
+                days = dur.total_seconds() / 86400 if dur else 0
+                name = r["name"] or f"#{r['unit_id']}"
+                where = f" · {r['building_name']}" if r.get("building_name") else ""
+                dur_str = format_duration(dur) if dur else "—"
+
+                if days < 7:
+                    badge = "🔴 риск"
+                elif days < 30:
+                    badge = "🟡 оплачено"
+                else:
+                    badge = "🟢 VIP"
+
                 lines.append(
-                    f"🟢 ID #{e.unit_id}{where} · 💰 {price}{tax_str}\n"
-                    f"    ⏱ {when}{oo}"
+                    f"• {name}{where} · 👤 {r['owner_name']} — ⏱ {dur_str} — {badge}"
                 )
 
         header = (
-            f"<b>⚡ Возможные слёты · {server_name}</b>\n"
-            f"Освобождения за последние 48 ч\n\n"
+            f"<b>⚡ Прогноз слётов · {server_name}</b>\n"
+            f"🔴 <7д — риск (не оплачен)  🟡 7-30д — оплачено  🟢 >30д — VIP\n\n"
         )
         await self._reply_chunked(message, lines, header,
                                   footer_kb=self._back_kb("catalog"))

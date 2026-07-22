@@ -1916,34 +1916,54 @@ class ApartmentBot:
 
     async def cmd_crashday(self, message: Message, user_id: Optional[int] = None) -> None:
         uid = user_id or message.from_user.id
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone.utc)
+        since = today.replace(hour=0, minute=0, second=0, microsecond=0)
         async with DatabaseSession.get_session_context() as session:
-            from app.database.repository import CrashDayLogRepository
-            repo = CrashDayLogRepository(session)
-            records = await repo.get_by_date(today)
+            from app.database.repository import RealEstateRepository
+            from app.scraper.realestate_client import sid_to_server_name
+            repo = RealEstateRepository(session)
+            events = await repo.get_events_since(since, event_types=["freed", "converted"])
 
-        if not records:
+        if not events:
             await message.answer("📉 Слётов за сегодня не было.", parse_mode="HTML",
                                  reply_markup=self._back_kb("main"))
             return
 
-        lines = [f"<b>📉 Слёты за {today}</b>\n"]
-        total = 0
-        for i, rec in enumerate(records, 1):
-            import json
-            try:
-                apts = json.loads(rec.apartments_data)
-            except (json.JSONDecodeError, TypeError):
-                apts = []
-            total += rec.total_freed
-            t = rec.detected_at.strftime("%H:%M") if rec.detected_at else "?"
-            lines.append(f"<b>{i}. {t}</b> — освободилось {rec.total_freed} кв.:")
-            for apt in apts:
-                lines.append(f"   🏠 {apt}")
+        freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
+        freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
+        converted = [e for e in events if e.event_type == "converted"]
+
+        date_str = today.strftime("%d.%m.%Y")
+        lines = [f"<b>📉 Слёты за {date_str}</b>\n"]
+        lines.append(f"🏠 Слетело домов: <b>{len(freed_houses)}</b>")
+        lines.append(f"🏢 Слетело квартир: <b>{len(freed_apts)}</b>")
+        if converted:
+            lines.append(f"🏛 Конвертировано в особняк: <b>{len(converted)}</b>")
+        lines.append("")
+
+        if freed_houses:
+            lines.append("<b>Дома:</b>")
+            for e in freed_houses:
+                server = sid_to_server_name(e.server_sid) if e.server_sid else "?"
+                name = e.name or f"#{e.object_key.split(':')[-1]}"
+                t = e.detected_at.strftime("%H:%M") if e.detected_at else "?"
+                cls = f" ({e.class_name})" if e.class_name else ""
+                owner = f" · {e.old_owner}" if e.old_owner else ""
+                lines.append(f"  🏠 [{server}] {name}{cls}{owner} — {t}")
             lines.append("")
 
-        lines.append(f"┃ Всего освободилось квартир: {total}")
+        if freed_apts:
+            lines.append("<b>Квартиры:</b>")
+            for e in freed_apts:
+                server = sid_to_server_name(e.server_sid) if e.server_sid else "?"
+                name = e.name or f"#{e.object_key.split(':')[-1]}"
+                t = e.detected_at.strftime("%H:%M") if e.detected_at else "?"
+                bld = f" · {e.building_name}" if e.building_name else ""
+                owner = f" · {e.old_owner}" if e.old_owner else ""
+                lines.append(f"  🏢 [{server}] {name}{bld}{owner} — {t}")
+            lines.append("")
+
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("main"))
 

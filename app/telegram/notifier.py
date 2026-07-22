@@ -181,17 +181,20 @@ class ChangeNotifier:
         )
 
     async def _recipients_for_server(
-        self, session, server_sid: Optional[str], kind: Optional[str] = None
+        self, session, server_sid: Optional[str],
+        kind: Optional[str] = None, class_name: Optional[str] = None,
     ) -> List[int]:
         """Resolve who should receive an alert for a server.
 
-        Only users subscribed to the server (and matching kind) get it.
+        Only users subscribed to the server (and matching kind/class) get it.
         """
         if not server_sid:
             return []
 
         sub_repo = SubscriptionRepository(session)
-        subs = await sub_repo.get_subscribers(server_sid, kind=kind)
+        subs = await sub_repo.get_subscribers(
+            server_sid, kind=kind, class_name=class_name,
+        )
         subscriber_ids = [s.user_id for s in subs]
         if subscriber_ids:
             seen = set()
@@ -749,7 +752,8 @@ class ChangeNotifier:
                         dur_str = format_duration(td)
                         message = self._build_realestate_message(event, dur_str)
                 recipients = await self._recipients_for_server(
-                    session, event.server_sid, kind=event.kind
+                    session, event.server_sid, kind=event.kind,
+                    class_name=event.class_name,
                 )
                 for user_id in recipients:
                     await send_notification(self.bot, user_id, message,

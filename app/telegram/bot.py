@@ -273,9 +273,13 @@ class ApartmentBot:
         rows = []
         for s in subs:
             name = sid_to_server_name(s.server_sid) or f"sid {s.server_sid}"
-            rows.append([self._btn(
-                f"❌ {name} · {kind_ru.get(s.kind, s.kind)}", f"sub:del:{s.server_sid}"
-            )])
+            label = f"{name} · {kind_ru.get(s.kind, s.kind)}"
+            if s.class_name:
+                label += f" ({s.class_name})"
+            del_suffix = f":{s.kind}"
+            if s.class_name:
+                del_suffix += f":{s.class_name}"
+            rows.append([self._btn(f"❌ {label}", f"sub:del:{s.server_sid}{del_suffix}")])
         rows.append([self._btn("➕ Подписаться", "menu:subpick")])
         rows.append([self._btn("⬅️ Назад", "menu:main")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -321,9 +325,23 @@ class ApartmentBot:
         b = self._btn
         return InlineKeyboardMarkup(inline_keyboard=[
             [b(f"🔔 {name}: все объекты", f"sub:add:{sid}:any")],
-            [b("🏠 только дома", f"sub:add:{sid}:house"),
+            [b("🏠 дома", f"sub:class:{sid}"),
              b("🏢 только квартиры", f"sub:add:{sid}:apartment")],
             [b("⬅️ Назад", "menu:subpick")],
+        ])
+
+    def _sub_class_markup(self, sid: str) -> InlineKeyboardMarkup:
+        from app.scraper.realestate_client import sid_to_server_name
+        name = sid_to_server_name(sid) or f"sid {sid}"
+        b = self._btn
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [b(f"🔔 {name}: дома (любой класс)", f"sub:add:{sid}:house")],
+            [b("🏠 Престиж", f"sub:add:{sid}:house:Престиж"),
+             b("🏠 Стандарт", f"sub:add:{sid}:house:Стандарт")],
+            [b("🏠 Эконом", f"sub:add:{sid}:house:Эконом"),
+             b("🏠 Комфорт", f"sub:add:{sid}:house:Комфорт")],
+            [b("🏠 Премиум", f"sub:add:{sid}:house:Премиум")],
+            [b("⬅️ Назад", f"subkind:{sid}")],
         ])
 
     async def _edit_menu(self, query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
@@ -419,17 +437,29 @@ class ApartmentBot:
             await query.answer()
             await self._edit_menu(query, "<b>Выберите тип объектов</b>", self._sub_kind_markup(sid))
             return
+        if data.startswith("sub:class:"):
+            sid = data.split(":", 2)[2]
+            await query.answer()
+            await self._edit_menu(query, f"<b>Выберите класс дома</b>", self._sub_class_markup(sid))
+            return
         if data.startswith("sub:add:"):
-            _, _, sid, kind = data.split(":", 3)
-            await self._do_subscribe(uid, sid, kind)
+            parts = data.split(":")
+            # sub:add:<sid>:<kind> or sub:add:<sid>:<kind>:<class_name>
+            sid = parts[2]
+            kind = parts[3]
+            class_name = parts[4] if len(parts) >= 5 else None
+            await self._do_subscribe(uid, sid, kind, class_name)
             await query.answer("✅ Подписка оформлена")
             await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
                                   "Уведомления приходят вам лично по выбранным серверам.",
                                   await self._subs_markup(uid))
             return
         if data.startswith("sub:del:"):
-            sid = data.split(":", 2)[2]
-            await self._do_unsubscribe(uid, sid)
+            parts = data.split(":")
+            sid = parts[2]
+            kind = parts[3] if len(parts) >= 4 else None
+            class_name = parts[4] if len(parts) >= 5 else None
+            await self._do_unsubscribe(uid, sid, kind, class_name)
             await query.answer("❌ Подписка удалена")
             await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
                                   "Уведомления приходят вам лично по выбранным серверам.",
@@ -592,12 +622,15 @@ class ApartmentBot:
 
     # ---- Subscription helpers (use the REAL invoking user id) ----
 
-    async def _do_subscribe(self, uid: int, sid: str, kind: str) -> None:
+    async def _do_subscribe(
+        self, uid: int, sid: str, kind: str,
+        class_name: Optional[str] = None,
+    ) -> None:
         from app.database.repository import SubscriptionRepository, UserServerSelectionRepository
         from app.scraper.realestate_client import sid_to_server_name
         async with DatabaseSession.get_session_context() as session:
             repo = SubscriptionRepository(session)
-            await repo.subscribe(uid, sid, kind=kind)
+            await repo.subscribe(uid, sid, kind=kind, class_name=class_name)
             # Ensure this server gets polled by the scheduler. Save it as the
             # user's active selection so _refresh_servers (which unions all user
             # selections) picks it up. This way subscribing to ANY wiki server
@@ -605,11 +638,14 @@ class ApartmentBot:
             sel_repo = UserServerSelectionRepository(session)
             await sel_repo.set(uid, sid)
 
-    async def _do_unsubscribe(self, uid: int, sid: str) -> None:
+    async def _do_unsubscribe(
+        self, uid: int, sid: str,
+        kind: Optional[str] = None, class_name: Optional[str] = None,
+    ) -> None:
         from app.database.repository import SubscriptionRepository
         async with DatabaseSession.get_session_context() as session:
             repo = SubscriptionRepository(session)
-            await repo.unsubscribe(uid, sid)
+            await repo.unsubscribe(uid, sid, kind=kind, class_name=class_name)
 
     async def _toggle_setting_report(self, message: Message, key: str, label: str) -> None:
         from app.database.repository import ScraperSettingsRepository

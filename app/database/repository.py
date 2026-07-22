@@ -843,7 +843,8 @@ class SubscriptionRepository:
         self.session = session
 
     async def subscribe(
-        self, user_id: int, server_sid: str, kind: str = "any"
+        self, user_id: int, server_sid: str, kind: str = "any",
+        class_name: Optional[str] = None,
     ) -> RealEstateSubscription:
         """Create or update a user's subscription to a server (idempotent)."""
         result = await self.session.execute(
@@ -851,29 +852,43 @@ class SubscriptionRepository:
                 and_(
                     RealEstateSubscription.user_id == user_id,
                     RealEstateSubscription.server_sid == server_sid,
+                    RealEstateSubscription.kind == kind,
+                    RealEstateSubscription.class_name == class_name,
                 )
             )
         )
         sub = result.scalar_one_or_none()
         if sub:
             sub.kind = kind
+            sub.class_name = class_name
         else:
             sub = RealEstateSubscription(
-                user_id=user_id, server_sid=server_sid, kind=kind
+                user_id=user_id, server_sid=server_sid, kind=kind,
+                class_name=class_name,
             )
             self.session.add(sub)
         await self.session.flush()
         return sub
 
-    async def unsubscribe(self, user_id: int, server_sid: str) -> bool:
-        """Remove a user's subscription to a server. Returns True if one existed."""
+    async def unsubscribe(
+        self, user_id: int, server_sid: str,
+        kind: Optional[str] = None, class_name: Optional[str] = None,
+    ) -> bool:
+        """Remove a user's subscription(s). Returns True if any existed.
+
+        With only server_sid removes all subs for that server (backward compat);
+        with kind/class_name removes only the matching row.
+        """
+        conditions = [
+            RealEstateSubscription.user_id == user_id,
+            RealEstateSubscription.server_sid == server_sid,
+        ]
+        if kind is not None:
+            conditions.append(RealEstateSubscription.kind == kind)
+        if class_name is not None:
+            conditions.append(RealEstateSubscription.class_name == class_name)
         result = await self.session.execute(
-            delete(RealEstateSubscription).where(
-                and_(
-                    RealEstateSubscription.user_id == user_id,
-                    RealEstateSubscription.server_sid == server_sid,
-                )
-            )
+            delete(RealEstateSubscription).where(and_(*conditions))
         )
         await self.session.flush()
         return (result.rowcount or 0) > 0
@@ -888,12 +903,15 @@ class SubscriptionRepository:
         return list(result.scalars().all())
 
     async def get_subscribers(
-        self, server_sid: str, kind: Optional[str] = None
+        self, server_sid: str, kind: Optional[str] = None,
+        class_name: Optional[str] = None,
     ) -> List[RealEstateSubscription]:
-        """Return subscriptions for a server, optionally matching a kind.
+        """Return subscriptions for a server, optionally matching kind/class.
 
         A subscription with kind "any" matches every kind; a kind-specific
-        subscription matches only its own kind.
+        subscription matches only its own kind. When class_name is provided,
+        a subscription matches if its class_name is NULL (any class) or
+        equals the given class_name.
         """
         conditions = [RealEstateSubscription.server_sid == server_sid]
         if kind:
@@ -901,6 +919,13 @@ class SubscriptionRepository:
                 or_(
                     RealEstateSubscription.kind == "any",
                     RealEstateSubscription.kind == kind,
+                )
+            )
+        if class_name:
+            conditions.append(
+                or_(
+                    RealEstateSubscription.class_name.is_(None),
+                    RealEstateSubscription.class_name == class_name,
                 )
             )
         result = await self.session.execute(

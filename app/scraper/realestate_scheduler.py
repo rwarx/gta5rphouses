@@ -122,13 +122,18 @@ class RealEstateScheduler:
 
     async def _loop(self) -> None:
         while self._running:
-            interval = self._current_interval()
-            elapsed = (
-                (datetime.now(timezone.utc) - self._last_tick).total_seconds()
-                if self._last_tick else interval + 1
-            )
-            if elapsed >= interval:
-                await self._tick()
+            try:
+                interval = self._current_interval()
+                elapsed = (
+                    (datetime.now(timezone.utc) - self._last_tick).total_seconds()
+                    if self._last_tick else interval + 1
+                )
+                if elapsed >= interval:
+                    await self._tick()
+            except Exception as e:
+                logger.error(f"RealEstate scheduler loop error: {e}")
+                # Small delay to avoid busy-looping on persistent errors
+                await asyncio.sleep(5)
             await asyncio.sleep(1)
 
     def _in_payday_window(self) -> bool:

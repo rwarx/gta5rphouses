@@ -317,7 +317,7 @@ class ChangeNotifier:
         if nick_changes:
             lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
 
-        if not events:
+        if not freed_houses and not freed_apts and not real_possibly:
             lines.append("\n<i>За этот час изменений не было.</i>")
             return "\n".join(lines)
 
@@ -584,7 +584,7 @@ class ChangeNotifier:
         if nick_changes:
             lines.append(f"📝 Смена ника (не слёт): <b>{nick_changes}</b>")
 
-        if not events:
+        if not freed_houses and not freed_apts and not real_possibly:
             lines.append("\n<i>За этот час изменений не было.</i>")
             return "\n".join(lines)
 
@@ -720,7 +720,7 @@ class ChangeNotifier:
 
         for event in events:
             try:
-                if event.event_type != "freed":
+                if event.event_type not in ("freed",):
                     # Folded into the hourly report; no instant message.
                     await realestate_repo.mark_event_notified(event.id)
                     continue

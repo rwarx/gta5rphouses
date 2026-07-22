@@ -115,7 +115,11 @@ class SmartScheduler:
 
     async def _smart_loop(self) -> None:
         while self._running:
-            await self._smart_tick()
+            try:
+                await self._smart_tick()
+            except Exception as e:
+                logger.error(f"Smart scheduler loop error: {e}")
+                await asyncio.sleep(5)
 
     def _init_map_gate(self) -> None:
         """Prepare the map-update gate (resolve the catalog server sid once)."""

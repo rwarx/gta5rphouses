@@ -133,17 +133,27 @@ class RealEstateDetector:
                     new_owner=unit.owner_name,
                 ))
 
-        # 2. Objects that disappeared from the catalog -> freed.
+        # 2. Objects that disappeared from the catalog.
+        #    A Престиж house vanishing during a Payday recompute is actually a
+        #    conversion to a mansion, not a real free — record it as "converted"
+        #    so the notifier suppresses the false-alarm ping.
         current_keys = set(current.keys())
         for key, prev_obj in previous.items():
             if key in current_keys:
                 continue
+            is_conversion = (
+                is_payday
+                and prev_obj.kind == "house"
+                and prev_obj.class_name == "Престиж"
+            )
+            event_type = "converted" if is_conversion else "freed"
+            # Still mark as freed in DB so it doesn't re-trigger next diff
             await self.repo.mark_freed(key)
             await self.repo.create_event({
                 "object_key": key,
                 "server_sid": server_sid,
                 "kind": prev_obj.kind,
-                "event_type": "freed",
+                "event_type": event_type,
                 "name": prev_obj.name,
                 "price": prev_obj.price,
                 "class_name": prev_obj.class_name,
@@ -151,7 +161,7 @@ class RealEstateDetector:
                 "old_owner": prev_obj.owner_name,
             })
             changes.append(RealEstateChange(
-                object_key=key, event_type="freed", kind=prev_obj.kind,
+                object_key=key, event_type=event_type, kind=prev_obj.kind,
                 name=prev_obj.name or "", old_owner=prev_obj.owner_name,
             ))
 

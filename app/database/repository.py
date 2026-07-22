@@ -722,7 +722,7 @@ class RealEstateRepository:
                     ro.object_key, ro.kind, ro.unit_id, ro.name,
                     ro.building_name, ro.class_name, ro.price,
                     ro.vehicle_count, ro.owner_name,
-                    MIN(roh.recorded_at) AS acquired_at
+                    COALESCE(MIN(roh.recorded_at), ro.first_seen_at) AS acquired_at
                 FROM realestate_objects ro
                 LEFT JOIN realestate_owner_history roh
                     ON roh.object_key = ro.object_key
@@ -731,8 +731,9 @@ class RealEstateRepository:
                   AND ro.is_occupied = true
                 GROUP BY ro.object_key, ro.kind, ro.unit_id, ro.name,
                          ro.building_name, ro.class_name, ro.price,
-                         ro.vehicle_count, ro.owner_name
-                ORDER BY acquired_at DESC NULLS LAST
+                         ro.vehicle_count, ro.owner_name,
+                         ro.first_seen_at
+                ORDER BY acquired_at DESC
             """),
             {"sid": server_sid},
         )

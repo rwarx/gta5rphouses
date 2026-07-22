@@ -121,6 +121,7 @@ class ApartmentBot:
         self.dp.message.register(self.cmd_unsubscribe, Command("unsubscribe"))
         self.dp.message.register(self.cmd_subscriptions, Command("subscriptions"))
         self.dp.message.register(self.cmd_menu, Command("menu"))
+        self.dp.message.register(self.cmd_test_sound, Command("test_sound"))
 
         # FSM: buttons that need free text put the user into a state; these
         # handlers read the next message and run the corresponding query.
@@ -2175,6 +2176,24 @@ class ApartmentBot:
         else:
             text = "✅ Карта стабильна."
         await message.answer(text, parse_mode="HTML", reply_markup=self._back_kb("admin"))
+
+    async def cmd_test_sound(self, message: Message) -> None:
+        """TEMP: send a test notification with sound."""
+        if not self._is_admin(message.from_user.id):
+            return
+        await message.answer("🔔 <b>Тестовое уведомление со звуком</b>", parse_mode="HTML")
+        await self.bot.send_message(
+            message.from_user.id,
+            "🕐✅ <b>Точные данные — Murrieta</b>\n"
+            "━━━━━━━━━━━━━━━\n"
+            "🏠 Слетело домов: <b>1</b>\n\n"
+            "<b>Подтверждённые слёты:</b>\n"
+            "• Дом #42: Test_Owner\n\n"
+            "<i>Это тестовое сообщение. Если вы его слышите — звук работает.</i>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            disable_notification=False,
+        )
 
 
 async def send_notification(

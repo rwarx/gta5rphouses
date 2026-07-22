@@ -986,7 +986,7 @@ class ApartmentBot:
 
         header = (
             f"<b>⚡ Прогноз слётов · {server_name}</b>\n"
-            f"🔴 <7д — риск (не оплачен)  🟡 7-30д — оплачено  🟢 >30д — VIP\n\n"
+            f"🔴 &lt;7д — риск (не оплачен)  🟡 7-30д — оплачено  🟢 &gt;30д — VIP\n\n"
         )
         await self._reply_chunked(message, lines, header,
                                   footer_kb=self._back_kb("catalog"))

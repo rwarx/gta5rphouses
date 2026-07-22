@@ -233,7 +233,8 @@ class ApartmentBot:
                 [b("🏢 Статус каталога", "act:realestate")],
                 [b("🏢 Здания", "pick:buildings"), b("🏠 Дома", "pick:houses")],
                 [b("👤 По владельцу", "ask:owners"), b("📜 История ников", "ask:owner_history")],
-                [b("⏱ Срок владения", "act:ownership_durations")],
+                [b("⏱ Срок владения", "act:ownership_durations"),
+                 b("⚡ Возможные слёты", "act:possible_frees")],
                 [b("🌐 Серверы", "act:servers")],
                 [b("⬅️ Назад", "menu:main")],
             ]
@@ -522,6 +523,7 @@ class ApartmentBot:
             "report_now": self._report_now,
             "latest_data": self._latest_data,
             "ownership_durations": self.cmd_ownership_durations,
+            "possible_frees": self.cmd_possible_frees,
         }
         handler = handlers.get(action)
         if handler:
@@ -923,6 +925,71 @@ class ApartmentBot:
                 lines.append(f"• {name}{where} · 👤 {r['owner_name']} — ⏱ {dur}{badge}{tax_str}")
 
         header = f"<b>⏱ Срок владения · {server_name}</b>\n"
+        await self._reply_chunked(message, lines, header,
+                                  footer_kb=self._back_kb("catalog"))
+
+    async def cmd_possible_frees(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Show recently freed objects that may free again."""
+        uid = user_id or message.from_user.id
+        d_sid, d_name = await self._default_sid_for_user(uid)
+        if not d_sid:
+            await message.answer("⚠️ Сначала выберите сервер.")
+            return
+        await self._render_possible_frees(message, d_sid, d_name or "")
+
+    async def _render_possible_frees(self, message: Message, sid: str,
+                                     server_name: str) -> None:
+        from app.database.repository import RealEstateRepository
+        from app.scraper.realestate_client import sid_to_server_name
+        from app.services.tax import format_tax
+
+        server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            events = await repo.get_possible_frees(sid, hours=48)
+
+        if not events:
+            await message.answer(
+                "✅ За последние 48 часов освобождений не было.",
+                reply_markup=self._back_kb("catalog"),
+            )
+            return
+
+        houses = [e for e in events if e.kind == "house"]
+        apts = [e for e in events if e.kind == "apartment"]
+
+        lines = []
+        if houses:
+            lines.append("<b>🏠 Дома</b>")
+            for e in houses:
+                when = e.detected_at.strftime("%d.%m %H:%M")
+                price = self._fmt_price(e.price) if e.price else "—"
+                cls = f" · 🏷 {e.class_name}" if e.class_name else ""
+                oo = f" 👤 {e.old_owner}" if e.old_owner else ""
+                lines.append(
+                    f"🟢 ID #{e.object_key.split(':')[-1]} · 💰 {price}{cls}\n"
+                    f"    ⏱ {when}{oo}"
+                )
+        if apts:
+            if houses:
+                lines.append("")
+            lines.append("<b>🏢 Квартиры</b>")
+            for e in sorted(apts, key=lambda x: (x.building_name or "", x.unit_id)):
+                when = e.detected_at.strftime("%d.%m %H:%M")
+                price = self._fmt_price(e.price) if e.price else "—"
+                where = f" · {e.building_name}" if e.building_name else ""
+                tax_str = f" · {format_tax(e.class_name)}" if e.class_name else ""
+                oo = f" 👤 {e.old_owner}" if e.old_owner else ""
+                lines.append(
+                    f"🟢 ID #{e.unit_id}{where} · 💰 {price}{tax_str}\n"
+                    f"    ⏱ {when}{oo}"
+                )
+
+        header = (
+            f"<b>⚡ Возможные слёты · {server_name}</b>\n"
+            f"Освобождения за последние 48 ч\n\n"
+        )
         await self._reply_chunked(message, lines, header,
                                   footer_kb=self._back_kb("catalog"))
 

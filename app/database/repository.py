@@ -597,6 +597,17 @@ class RealEstateRepository:
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
+    async def get_possible_frees(
+        self, server_sid: str, hours: int = 48
+    ) -> List[RealEstateEvent]:
+        """Return freed events within the last N hours for a server."""
+        since = datetime.utcnow() - timedelta(hours=hours)
+        return await self.get_events_since(
+            since=since,
+            event_types=["freed"],
+            server_sid=server_sid,
+        )
+
     async def count_occupied(self, server_sid: str, kind: Optional[str] = None) -> int:
         """Count currently-occupied objects for a server, optionally by kind."""
         conditions = [

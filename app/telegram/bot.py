@@ -826,6 +826,7 @@ class ApartmentBot:
                                 server_name: Optional[str] = None) -> None:
         from app.database.repository import RealEstateRepository
         from app.scraper.realestate_client import sid_to_server_name
+        from app.services.tax import format_tax
 
         if not sid:
             await message.answer("⚠️ Сервер не распознан.")
@@ -856,9 +857,10 @@ class ApartmentBot:
             for u in units:
                 cls = f" · 🏷 {u.class_name}" if u.class_name else ""
                 garage = f" · 🚗 {u.vehicle_count}гм" if u.vehicle_count else ""
+                tax_str = f" · {format_tax(u.class_name)}" if u.class_name else ""
                 lines.append(
                     f"🔴 {u.name or ('#' + str(u.unit_id))} · ID #{u.unit_id}{cls}{garage}\n"
-                    f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}"
+                    f"    👤 {u.owner_name or '—'} · 💰 {self._fmt_price(u.price)}{tax_str}"
                 )
 
         header = f"<b>🏢 Все квартиры с владельцами · {server_name}</b>\n"
@@ -881,6 +883,8 @@ class ApartmentBot:
     ) -> None:
         from app.database.repository import RealEstateRepository
         from app.telegram.notifier import format_duration
+        from app.services.tax import format_tax, paid_status
+        from datetime import timedelta
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -913,7 +917,10 @@ class ApartmentBot:
                 dur = format_duration(r["duration"]) if r["duration"] else "—"
                 where = f" · {r['building_name']}" if r.get("building_name") else ""
                 name = r["name"] or f"#{r['unit_id']}"
-                lines.append(f"• {name}{where} · 👤 {r['owner_name']} — ⏱ {dur}")
+                days = (r["duration"].total_seconds() / 86400) if r["duration"] else 0
+                badge = f" {paid_status(days)}" if days > 0 else ""
+                tax_str = f" · {format_tax(r['class_name'])}" if r.get("class_name") else ""
+                lines.append(f"• {name}{where} · 👤 {r['owner_name']} — ⏱ {dur}{badge}{tax_str}")
 
         header = f"<b>⏱ Срок владения · {server_name}</b>\n"
         await self._reply_chunked(message, lines, header,

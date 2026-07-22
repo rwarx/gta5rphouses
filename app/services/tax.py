@@ -28,3 +28,13 @@ def format_tax(class_name: str) -> str:
     if h == 0:
         return ""
     return f"💵 ${h}/ч · ${daily_tax(class_name)}/сут · ${weekly_tax(class_name)}/7дн"
+
+
+def paid_status(days_held: float) -> str:
+    """Return a badge string based on how many days the owner has held the apt.
+
+    >7 days → owner must be paying or has VIP → safe.
+    """
+    if days_held >= 7:
+        return "✅"
+    return ""

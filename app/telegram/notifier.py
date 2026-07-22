@@ -294,10 +294,15 @@ class ChangeNotifier:
                                                      sid, durations)
                 for user_id in recipients:
                     await send_notification(self.bot, user_id, message)
-                    # Store pending final report for this server
-                    self._pending_final_reports.setdefault(sid, []).append(
-                        (user_id, since, now)
-                    )
+                    # Store pending final report only if the catalog hasn't
+                    # recomputed yet — otherwise the quick report already has
+                    # complete data from this recompute and a second message
+                    # would be redundant.
+                    recompute_marker = await settings_repo.get(f"catalog_recompute:{sid}")
+                    if not recompute_marker or recompute_marker == "0":
+                        self._pending_final_reports.setdefault(sid, []).append(
+                            (user_id, since, now)
+                        )
 
     def _build_hourly_report(self, events, since, now, server_sid=None,
                              ownership_durations: Optional[dict] = None) -> str:

@@ -1,7 +1,8 @@
 """
 Playwright scraper for GTA5RP wiki map.
-Uses Seoul Towers carousel navigation to find and click apartment markers.
+Opens the sidebar, finds an apartment building item, and iterates the popup carousel.
 """
+
 import asyncio
 import random
 import re
@@ -63,16 +64,16 @@ class ApartmentData:
 
 
 class ApartmentScraper:
-    """Parser for GTA5RP wiki map using Seoul carousel navigation."""
+    """Parser for GTA5RP wiki map using sidebar + popup carousel navigation."""
 
     def __init__(self, browser_manager: AntiDetectManager):
         self.browser_manager = browser_manager
         self.settings = get_settings()
 
     async def scrape_all_apartments(self) -> List[ApartmentData]:
-        """Full scrape using Seoul popup nav (next/prev buttons inside popup)."""
+        """Full scrape: expand sidebar, find apartment popup, iterate carousel."""
         logger.info("=" * 50)
-        logger.info("Starting map scraper (Seoul popup nav method)")
+        logger.info("Starting map scraper (sidebar + popup carousel)")
 
         page = await self.browser_manager.create_page()
         await page.set_viewport_size({"width": 1920, "height": 1080})
@@ -114,42 +115,11 @@ class ApartmentScraper:
 
             await asyncio.sleep(3)
 
-            # Open Seoul Towers category
-            total = await self._open_seoul_category(page)
-            if not total:
-                logger.warning("Could not open Seoul Towers category")
-                await page.screenshot(path="debug_no_seoul.png")
+            total, apartments = await self._open_and_scrape_carousel(page)
+            if total is None or total == 0:
+                logger.warning("Could not open apartment carousel")
+                await page.screenshot(path="debug_no_carousel.png")
                 return []
-
-            logger.info(f"Seoul category opened: {total} items")
-
-            # Open first popup by clicking map center (keep popup open)
-            first_data = await self._click_center_and_extract(page, 0, total, close_after=False)
-            apartments = [first_data] if first_data else []
-
-            # Navigate remaining items using popup "next" button (popup stays open)
-            for i in range(1, total):
-                try:
-                    clicked = await page.evaluate("""() => {
-                        const btn = document.querySelector('[data-popup-action="next"]');
-                        if (!btn || btn.disabled) return false;
-                        btn.click();
-                        return true;
-                    }""")
-                    if not clicked:
-                        logger.warning(f"[{i+1}/{total}] No next button available")
-                        break
-
-                    await asyncio.sleep(1.5)
-                    data = await self._extract_popup_data(page)
-                    if data:
-                        apartments.append(data)
-                except Exception as e:
-                    logger.error(f"Error on item {i+1}/{total}: {e}")
-                    continue
-
-            # Close popup
-            await self._close_popup(page)
 
             logger.info(f"Scraped {len(apartments)}/{total} apartments")
             return apartments
@@ -160,110 +130,92 @@ class ApartmentScraper:
         finally:
             await page.close()
 
-    async def _open_seoul_category(self, page: Page) -> Optional[int]:
-        """Find Seoul Towers in nav sidebar, click it, return total item count."""
-        # Expand nav panel if collapsed
-        collapsed = await page.query_selector(".map-blips-nav__body--collapsed")
-        if collapsed:
-            surface = await page.query_selector(".map-blips-nav__surface")
-            if surface:
-                await surface.click()
-                await asyncio.sleep(0.5)
+    async def _open_and_scrape_carousel(self, page: Page) -> tuple:
+        """
+        Expand sidebar, find an apartment-building nav item, click it to open the
+        popup carousel, then iterate through all items. Returns (total_count, data_list).
+        """
+        # Expand sidebar by clicking the head button
+        head = await page.query_selector(".map-blips-nav__head")
+        if head:
+            expanded = await head.get_attribute("aria-expanded")
+            if expanded == "false":
+                await head.click()
+                await asyncio.sleep(1)
 
-        # Scroll Seoul Towers into view and click
-        seoul_found = await page.evaluate("""() => {
-            const items = document.querySelectorAll('.map-blips-nav__item');
-            for (const item of items) {
-                if ((item.textContent || '').includes('Seoul Towers')) {
-                    const btn = item.querySelector('.map-blips-nav__label-btn');
-                    if (btn) {
-                        btn.scrollIntoView({block: 'center'});
-                        setTimeout(() => btn.click(), 100);
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }""")
-        if not seoul_found:
-            return None
+        # Scan nav items until we find one whose popup has apartment stats
+        items = await page.query_selector_all(".map-blips-nav__item")
+        apartment_item = None
+        for item in items:
+            lbl = await item.query_selector(".map-blips-nav__label-btn")
+            if not lbl:
+                continue
+            await lbl.click()
+            await asyncio.sleep(2)
 
-        await asyncio.sleep(1.5)
-
-        # Read total count from sidebar "1/35" or from popup counter
-        count_text = await page.evaluate("""() => {
-            const items = document.querySelectorAll('.map-blips-nav__item');
-            for (const item of items) {
-                const t = item.textContent || '';
-                if (t.includes('Seoul Towers')) {
-                    const nav = item.querySelector('.map-blips-nav__nav');
-                    if (nav) return nav.textContent.trim();
-                }
-            }
-            return '';
-        }""")
-        if not count_text:
-            return None
-        match = re.search(r'(\d+)$', count_text)
-        return int(match.group(1)) if match else None
-
-    async def _click_center_and_extract(
-        self, page: Page, index: int, total: int, close_after: bool = True
-    ) -> Optional[ApartmentData]:
-        """Click viewport center (960, 540) where map marker is, extract popup."""
-        center_x, center_y = 960, 540
-
-        logger.info(f"[{index+1}/{total}] Clicking map center ({center_x}, {center_y})...")
-
-        await asyncio.sleep(1)
-
-        # Human-like mouse movement to center
-        await page.mouse.move(
-            random.randint(center_x - 300, center_x + 300),
-            random.randint(center_y - 200, center_y + 200),
-            steps=random.randint(5, 10)
-        )
-        await asyncio.sleep(random.uniform(0.3, 0.7))
-        await page.mouse.move(center_x, center_y, steps=random.randint(3, 5))
-        await asyncio.sleep(random.uniform(0.2, 0.4))
-        await page.mouse.click(center_x, center_y)
-        await asyncio.sleep(random.uniform(1, 2))
-
-        # Check for popup
-        popup = await page.query_selector(".map-blip-popup")
-        if not popup or not await popup.is_visible():
-            for dx, dy in [(30, 0), (-30, 0), (0, 30), (0, -30)]:
-                if await page.query_selector(".map-blip-popup"):
-                    break
-                await page.mouse.click(center_x + dx, center_y + dy)
-                await asyncio.sleep(0.8)
-                popup = await page.query_selector(".map-blip-popup")
-                if popup and await popup.is_visible():
+            popup = await page.query_selector(".map-blip-popup")
+            if popup:
+                stats = await popup.query_selector(".map-blip-popup__stats")
+                if stats:
+                    apartment_item = item
                     break
 
-            if not popup or not await popup.is_visible():
-                logger.warning(f"[{index+1}/{total}] No popup appeared")
-                return None
-
-        await asyncio.sleep(0.5)
-        data = await self._extract_popup_data(page)
-
-        if close_after:
+            # Close popup and try next
             await self._close_popup(page)
+            await asyncio.sleep(0.5)
 
-        return data
+        if apartment_item is None:
+            logger.warning("No apartment-building nav item found")
+            return None, []
+
+        # Read carousel total from popup
+        count_el = await page.query_selector(".map-blip-popup__nav-count")
+        total = 0
+        if count_el:
+            count_text = (await count_el.inner_text()).strip()
+            match = re.search(r'/(\d+)$', count_text)
+            if match:
+                total = int(match.group(1))
+
+        logger.info(f"Apartment carousel opened: {total} items")
+
+        # Extract first item
+        data = await self._extract_popup_data(page)
+        apartments = [data] if data else []
+
+        # Navigate remaining items
+        for i in range(1, total):
+            try:
+                clicked = await page.evaluate("""() => {
+                    const btn = document.querySelector('[data-popup-action="next"]');
+                    if (!btn || btn.disabled) return false;
+                    btn.click();
+                    return true;
+                }""")
+                if not clicked:
+                    logger.warning(f"[{i+1}/{total}] No next button available")
+                    break
+
+                await asyncio.sleep(1.5)
+                data = await self._extract_popup_data(page)
+                if data:
+                    apartments.append(data)
+            except Exception as e:
+                logger.error(f"Error on item {i+1}/{total}: {e}")
+                continue
+
+        await self._close_popup(page)
+        return total, apartments
 
     async def _extract_popup_data(self, page: Page) -> Optional[ApartmentData]:
-        """Extract apartment data from the visible popup using HTML structure."""
+        """Extract apartment data from the visible popup."""
         popup = await page.query_selector(".map-blip-popup")
         if not popup:
             return None
 
         data = ApartmentData()
         try:
-            text = await popup.inner_text()
             html = await popup.inner_html()
-            data.raw_data["full_text"] = text
             data.raw_data["full_html"] = html
 
             # Parse name from title
@@ -272,7 +224,7 @@ class ApartmentScraper:
                 data.name = (await name_el.inner_text()).strip()
                 data.apartment_id = re.sub(r'[^a-z0-9]', '_', data.name.lower()).strip('_')[:50]
 
-            # Parse stats from structured cells
+            # Parse stats from structured cells (same selectors as before)
             stats = await page.evaluate("""(sel) => {
                 const popup = document.querySelector(sel);
                 if (!popup) return {};
@@ -295,30 +247,21 @@ class ApartmentScraper:
             data.free_apartments = stats.get("free")
             data.occupied_apartments = stats.get("occupied")
 
-            # Parse apartment type bars
+            # Parse apartment type bars (new structure with nested spans)
             class_rows = await page.evaluate("""(sel) => {
                 const popup = document.querySelector(sel);
                 if (!popup) return [];
                 const bars = popup.querySelectorAll('.map-stats__bar');
                 const results = [];
-                const kw = ['стандарт','комфорт','люкс','standard','comfort','luxury','эконом','бизнес','премиум','студия'];
                 for (const bar of bars) {
-                    const barText = bar.textContent.trim();
-                    const barLines = barText.split('\\n').map(l => l.trim()).filter(Boolean);
-                    for (let i = 0; i < barLines.length; i++) {
-                        const line = barLines[i].toLowerCase();
-                        if (kw.some(k => line.includes(k))) {
-                            const name = barLines[i];
-                            let nums = [];
-                            for (let j = i; j < Math.min(i + 3, barLines.length); j++) {
-                                const m = barLines[j].match(/\\d+/g);
-                                if (m) nums.push(...m.map(Number));
-                            }
-                            if (nums.length >= 2) {
-                                results.push({name, free: nums[0], total: nums[1], occupied: nums.length >= 3 ? nums[2] : nums[1] - nums[0]});
-                            }
-                            break;
-                        }
+                    const nameEl = bar.querySelector('.map-stats__bar-name');
+                    const freeEl = bar.querySelector('.map-stats__bar-free');
+                    const totalEl = bar.querySelector('.map-stats__bar-total');
+                    if (nameEl && freeEl && totalEl) {
+                        const name = nameEl.textContent.trim();
+                        const free = parseInt(freeEl.textContent.trim()) || 0;
+                        const total = parseInt(totalEl.textContent.trim()) || 0;
+                        results.push({name, free, total, occupied: total - free});
                     }
                 }
                 return results;
@@ -333,13 +276,12 @@ class ApartmentScraper:
                 )
                 data.apartment_types.append(td)
 
-            # Parse updated time
-            lines = [l.strip() for l in text.split('\n') if l.strip()]
-            for line in lines:
-                lower = line.lower()
-                if "обновлен" in lower:
-                    parts = line.split(":", 1)
-                    data.last_updated = parts[1].strip() if len(parts) > 1 else line
+            # Parse updated time from dedicated element
+            updated_el = await popup.query_selector(".map-blip-popup__updated")
+            if updated_el:
+                text = await updated_el.inner_text()
+                parts = text.split(":", 1)
+                data.last_updated = parts[1].strip() if len(parts) > 1 else text
 
             link = await popup.query_selector("a[href*='wiki']")
             if link:
@@ -354,11 +296,16 @@ class ApartmentScraper:
         return data if data.name else None
 
     async def _close_popup(self, page: Page) -> None:
-        """Close popup by clicking outside it (on the overlay backdrop)."""
+        """Close popup by clicking its close button or outside it."""
         try:
+            close_btn = await page.query_selector(".map-popup__close")
+            if close_btn:
+                await close_btn.click()
+                await asyncio.sleep(0.3)
+                return
+
             viewport = page.viewport_size
             if viewport:
-                # Click top-left corner outside popup
                 await page.mouse.click(10, 10)
                 await asyncio.sleep(0.3)
         except:

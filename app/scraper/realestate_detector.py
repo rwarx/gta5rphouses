@@ -102,6 +102,14 @@ class RealEstateDetector:
                 await self.repo.create_event(
                     self._event_data(server_sid, unit, "occupied", new_owner=unit.owner_name)
                 )
+                await self.repo.add_owner_history(
+                    object_key=key,
+                    server_sid=server_sid,
+                    kind=unit.kind,
+                    owner_name=unit.owner_name,
+                    previous_owner=None,
+                    during_payday=is_payday,
+                )
                 changes.append(RealEstateChange(
                     object_key=key, event_type="occupied", kind=unit.kind,
                     name=unit.name or "", new_owner=unit.owner_name,

@@ -12,6 +12,7 @@ caught as quickly as possible.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,9 +20,10 @@ from loguru import logger
 
 from app.config import get_settings
 from app.database.session import DatabaseSession
-from app.database.repository import ScraperLogRepository
+from app.database.repository import ScraperLogRepository, RealEstateRepository
 from app.scraper.realestate_client import (
     RealEstateClient, resolve_servers, sid_to_server_name,
+    RealEstateSnapshot,
 )
 from app.scraper.realestate_detector import RealEstateDetector
 
@@ -50,6 +52,12 @@ class RealEstateScheduler:
         # recomputes it (around Payday), so we only run the full diff when it
         # advances — tracked per sid so servers don't interfere.
         self._last_processed_fetched_at_ms: dict = {}
+        # Pre-payday snapshot state: set of sids for which we already saved
+        # the snapshot this cycle (resets when minute > 59).
+        self._snapshot_saved: set = set()
+        # Post-payday diff state: set of sids for which we already ran the
+        # snapshot-diff this cycle (resets when minute < 10).
+        self._diff_done: set = set()
 
     async def start(self) -> None:
         """Resolve the server sids and begin the polling loop."""
@@ -194,10 +202,10 @@ class RealEstateScheduler:
             fetched_ms is not None
             and fetched_ms == self._last_processed_fetched_at_ms.get(sid)
         ):
-            logger.debug(
-                f"RealEstate {name}: catalog unchanged "
-                f"(fetchedAtMs={fetched_ms}), skipping diff"
-            )
+            # Even if the marker hasn't advanced, check for scheduled snapshot
+            # save / diff so we don't miss the 59-minute / 10-minute windows.
+            await self._maybe_preday_snapshot(sid, name, snapshot)
+            await self._maybe_postday_diff(sid, name, snapshot)
             self._successful_runs += 1
             duration = (datetime.utcnow() - start_time).total_seconds()
             await self._save_log(start_time, "skipped", 0, 0, None, duration)
@@ -237,6 +245,9 @@ class RealEstateScheduler:
             await self._save_log(
                 start_time, "success", checked, len(changes), None, duration
             )
+            # Snapshot save / postday diff after a successful catalog recompute.
+            await self._maybe_preday_snapshot(sid, name, snapshot)
+            await self._maybe_postday_diff(sid, name, snapshot)
             return len(changes)
 
         except Exception as e:
@@ -271,6 +282,68 @@ class RealEstateScheduler:
                 })
         except Exception as e:
             logger.warning(f"Failed to save realestate log: {e}")
+
+    async def _maybe_preday_snapshot(self, sid: str, name: str,
+                                     snapshot: RealEstateSnapshot) -> None:
+        """Save a snapshot of all occupied objects at minute 59 (pre-payday)."""
+        if not self.settings.smart_mode.smart_mode:
+            return
+        minute = datetime.now(timezone.utc).minute
+        if minute != 59:
+            self._snapshot_saved.discard(sid)
+            return
+        if sid in self._snapshot_saved:
+            return
+        entries = []
+        for unit in [*snapshot.houses, *snapshot.apartments]:
+            key = RealEstateRepository.make_key(sid, unit.kind, unit.unit_id)
+            entries.append({
+                "object_key": key,
+                "kind": unit.kind,
+                "class_name": unit.class_name,
+                "name": unit.name,
+                "owner_name": unit.owner_name,
+                "price": unit.price,
+                "building_name": unit.building_name,
+            })
+        from app.database.repository import ScraperSettingsRepository
+        async with DatabaseSession.get_session_context() as session:
+            repo = ScraperSettingsRepository(session)
+            await repo.set(f"preday_snapshot:{sid}", json.dumps(entries, ensure_ascii=False))
+        self._snapshot_saved.add(sid)
+        logger.info(f"RealEstate {name}: pre-payday snapshot saved ({len(entries)} objects)")
+
+    async def _maybe_postday_diff(self, sid: str, name: str,
+                                   snapshot: RealEstateSnapshot) -> None:
+        """Compare pre-payday snapshot against current catalog → confirmed freed."""
+        if not self.settings.smart_mode.smart_mode:
+            return
+        minute = datetime.now(timezone.utc).minute
+        if minute < 10 or minute > 15:
+            self._diff_done.discard(sid)
+            return
+        if sid in self._diff_done:
+            return
+        from app.database.repository import ScraperSettingsRepository
+
+        async with DatabaseSession.get_session_context() as session:
+            settings_repo = ScraperSettingsRepository(session)
+            raw = await settings_repo.get(f"preday_snapshot:{sid}")
+            if raw is None:
+                return
+            pre_data = json.loads(raw)
+            detector = RealEstateDetector(session)
+            changes = await detector.generate_snapshot_diff_frees(
+                sid, pre_data, snapshot
+            )
+            # Clean up the snapshot so we don't re-diff on the next tick
+            await settings_repo.set(f"preday_snapshot:{sid}", "", "consumed")
+        if changes:
+            logger.info(
+                f"RealEstate {name}: post-payday diff found "
+                f"{len(changes)} confirmed freed object(s)"
+            )
+        self._diff_done.add(sid)
 
     @property
     def is_running(self) -> bool:

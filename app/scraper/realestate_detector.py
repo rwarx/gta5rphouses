@@ -24,6 +24,7 @@ also appended to RealEstateOwnerHistory so the nickname timeline is preserved.
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -178,6 +179,67 @@ class RealEstateDetector:
             f"{len(current)} occupied now, {len(previous)} before"
             + (" [first run, baseline only]" if is_first_run else "")
         )
+        return changes
+
+    async def generate_snapshot_diff_frees(
+        self, server_sid: str,
+        pre_snapshot: List[Dict[str, Any]],
+        current_snapshot: RealEstateSnapshot,
+    ) -> List[RealEstateChange]:
+        """Diff a pre-payday snapshot against the current catalog → 100% freed.
+
+        Objects present in *pre_snapshot* but absent from *current_snapshot*
+        (i.e. they disappeared from the catalog) are confirmed frees. Skips
+        Престиж→mansion conversions.
+        """
+        changes: List[RealEstateChange] = []
+        current_keys: set = set()
+        for unit in [*current_snapshot.houses, *current_snapshot.apartments]:
+            if unit.unit_id is None:
+                continue
+            key = self.repo.make_key(server_sid, unit.kind, unit.unit_id)
+            current_keys.add(key)
+
+        for entry in pre_snapshot:
+            key = entry["object_key"]
+            if key in current_keys:
+                continue
+            # Check if already recorded as freed today (avoid duplicates)
+            existing = await self.repo.get_events_since(
+                since=datetime.now(timezone.utc) - timedelta(hours=2),
+                event_types=["freed", "converted"],
+                server_sid=server_sid,
+            )
+            if any(e.object_key == key for e in existing):
+                continue
+            # Skip Престиж→mansion conversions
+            if entry.get("class_name") == "Престиж":
+                continue
+            await self.repo.mark_freed(key)
+            data = {
+                "object_key": key,
+                "server_sid": server_sid,
+                "kind": entry.get("kind", "house"),
+                "event_type": "freed",
+                "name": entry.get("name"),
+                "price": entry.get("price"),
+                "class_name": entry.get("class_name"),
+                "building_name": entry.get("building_name"),
+                "old_owner": entry.get("owner_name"),
+            }
+            await self.repo.create_event(data)
+            changes.append(RealEstateChange(
+                object_key=key, event_type="freed",
+                kind=entry.get("kind", "house"),
+                name=entry.get("name") or "",
+                old_owner=entry.get("owner_name"),
+            ))
+
+        if changes:
+            logger.info(
+                f"RealEstate snapshot-diff (server {server_sid}): "
+                f"{len(changes)} confirmed freed"
+            )
         return changes
 
     async def _persist_buildings(self, snapshot: RealEstateSnapshot) -> None:

@@ -121,7 +121,16 @@ class RealEstateDetector:
                     event_type = "freed"
                     await self.repo.mark_freed(key)
                 else:
-                    event_type = "possibly_freed" if is_payday else "owner_changed"
+                    # If the previous owner held it < 24 h, it's likely a
+                    # nickname change or 5VITO sale, not a real free.
+                    short_hold = False
+                    if is_payday:
+                        td = await self.repo.get_ownership_duration(
+                            key, prev_owner, datetime.now(timezone.utc)
+                        )
+                        if td and td.total_seconds() < 86400:
+                            short_hold = True
+                    event_type = "possibly_freed" if (is_payday and not short_hold) else "owner_changed"
                     await self.repo.add_owner_history(
                         object_key=key,
                         server_sid=server_sid,

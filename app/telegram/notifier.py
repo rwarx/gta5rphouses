@@ -589,7 +589,10 @@ class ChangeNotifier:
                         if td and td.total_seconds() > 0:
                             durations[e.id] = format_duration(td)
             message = self._build_final_report(events, since, now, server_sid, durations)
-            await send_notification(self.bot, user_id, message)
+            await self.bot.send_message(
+                user_id, message, parse_mode="HTML",
+                disable_web_page_preview=True, disable_notification=False,
+            )
         except Exception as e:
             logger.debug(f"Failed to send final report for {user_id}: {e}")
 

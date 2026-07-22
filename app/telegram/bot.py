@@ -360,22 +360,28 @@ class ApartmentBot:
         uid = query.from_user.id
         is_admin = self._is_admin(uid)
 
-        # --- Menu navigation (edit in place) ---
+        # --- Menu navigation (delete old messages, send fresh menu) ---
         if data.startswith("menu:"):
             section = data.split(":", 1)[1]
             await query.answer()
-            if section == "subs":
-                await self._edit_menu(query, "<b>🔔 Подписки на слёты</b>\n"
-                                      "Уведомления приходят вам лично по выбранным серверам.",
-                                      await self._subs_markup(uid))
-            elif section == "subpick":
-                await self._edit_menu(query, "<b>➕ Выберите сервер</b>",
-                                      self._server_pick_markup("subkind"))
-            elif section == "admin" and not is_admin:
+            if section == "admin" and not is_admin:
                 await query.answer("⛔ Только для админов", show_alert=True)
+                return
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            text = self._MENU_TEXT.get(section, self._MENU_TEXT["main"])
+            if section == "subs":
+                text = "<b>🔔 Подписки на слёты</b>\n" \
+                       "Уведомления приходят вам лично по выбранным серверам."
+                markup = await self._subs_markup(uid)
+            elif section == "subpick":
+                text = "<b>➕ Выберите сервер</b>"
+                markup = self._server_pick_markup("subkind")
             else:
-                await self._edit_menu(query, self._MENU_TEXT.get(section, self._MENU_TEXT["main"]),
-                                      self._menu_markup(section, uid))
+                markup = self._menu_markup(section, uid)
+            await query.message.answer(text, parse_mode="HTML", reply_markup=markup)
             return
 
         # --- Active-server selection (persisted per user) ---

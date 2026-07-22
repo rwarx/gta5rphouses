@@ -240,7 +240,6 @@ class ChangeNotifier:
 
         if self._last_report_hour is None:
             self._last_report_hour = hour_key
-            return
 
         async with DatabaseSession.get_session_context() as session:
             settings_repo = ScraperSettingsRepository(session)

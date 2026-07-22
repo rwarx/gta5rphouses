@@ -737,8 +737,8 @@ class ApartmentBot:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 price = f" · {e.price:,}".replace(",", " ") if e.price else ""
                 srv = servers.get(e.server_sid)
-                srv_tag = f" [{srv}]" if srv else ""
-                lines.append(f"• {when}{srv_tag} — {kind_ru} {e.name or e.object_key}{price}")
+                srv_tag = f"[{srv}] " if srv else ""
+                lines.append(f"• {srv_tag}{when} — {kind_ru} {e.name or e.object_key}{price}")
         else:
             lines.append("\n<i>Освобождений пока не зафиксировано.</i>")
 

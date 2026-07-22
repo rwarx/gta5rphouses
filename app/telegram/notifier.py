@@ -214,6 +214,15 @@ class ChangeNotifier:
 
         self._running = True
         self._started_at = datetime.now(timezone.utc)
+        # Clear stale recompute / map-scrape markers from previous sessions so
+        # _check_pending_finals does not instantly fire a "final" report on old
+        # data — it should wait for a fresh wiki recompute after this boot.
+        async with DatabaseSession.get_session_context() as session:
+            from app.database.repository import ScraperSettingsRepository
+            sr = ScraperSettingsRepository(session)
+            for row in await sr.get_all():
+                if row.key.startswith("catalog_recompute:") or row.key.startswith("map_scrape_done:"):
+                    await sr.set(row.key, "0", "reset on notifier start")
         logger.info("Change notifier started")
 
         while self._running:

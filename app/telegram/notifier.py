@@ -355,16 +355,23 @@ class ChangeNotifier:
         return "\n".join(lines)
 
     async def _check_pending_finals(self) -> None:
-        """Send final (точные данные) reports for servers whose map caught up."""
+        """Send final (точные данные) reports for servers whose map caught up.
+
+        Attempts early delivery once the map scrape catches up to the catalog
+        recompute. Falls back to a forced send after HH:10 UTC (the end of the
+        Payday window) so subscribers never wait longer than ~10 minutes.
+        """
         if not self._pending_final_reports:
             return
+        now = datetime.now(timezone.utc)
+        force = now.minute >= 10
         async with DatabaseSession.get_session_context() as session:
             settings_repo = ScraperSettingsRepository(session)
             for sid in list(self._pending_final_reports):
                 marker = await settings_repo.get(f"catalog_recompute:{sid}")
                 if marker is None:
                     continue
-                if not await self._map_caught_up(settings_repo, sid, marker):
+                if not force and not await self._map_caught_up(settings_repo, sid, marker):
                     continue
                 pending = self._pending_final_reports.pop(sid, [])
                 recipients = await self._recipients_for_server(session, sid)

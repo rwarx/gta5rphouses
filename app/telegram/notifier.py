@@ -574,25 +574,12 @@ class ChangeNotifier:
     async def _send_final_report(
         self, user_id: int, since: datetime, until: datetime, server_sid: str
     ) -> None:
-        """Re-query events and send a new «🕐✅ Точные данные» message.
-
-        Filters out possibly_freed events where the object is still occupied
-        (i.e. it was a player-to-player sale via 5VITO, not an actual free).
-        """
+        """Re-query events and send a new «🕐✅ Точные данные» message."""
         try:
             async with DatabaseSession.get_session_context() as session:
                 repo = RealEstateRepository(session)
                 events = await repo.get_events_since(since, until=until, server_sid=server_sid)
                 now = datetime.now(timezone.utc)
-                # Check each possibly_freed: if object still occupied → sale, not a free
-                possibly = [e for e in events if e.event_type == "possibly_freed"]
-                sold_keys = set()
-                for e in possibly:
-                    obj = await repo.get_object(e.object_key)
-                    if obj and obj.is_occupied:
-                        sold_keys.add(e.object_key)
-                # Drop events that turned out to be sales
-                events = [e for e in events if e.object_key not in sold_keys]
                 durations = {}
                 for e in events:
                     if e.event_type == "possibly_freed" and e.old_owner:

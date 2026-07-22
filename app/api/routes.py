@@ -307,6 +307,20 @@ async def trigger_scrape():
         return {"status": "error", "message": str(e)}
 
 
+@router.post("/admin/clean-prestige")
+async def clean_prestige(db: AsyncSession = Depends(get_db_session)):
+    from sqlalchemy import text
+    result = await db.execute(
+        text("""
+            DELETE FROM realestate_events
+            WHERE event_type = 'freed'
+              AND kind = 'house'
+              AND class_name = 'Престиж'
+        """)
+    )
+    await db.commit()
+    return {"deleted": result.rowcount}
+
 @router.get("/health")
 async def health_check():
     """Health check endpoint."""

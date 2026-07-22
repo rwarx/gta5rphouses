@@ -292,17 +292,22 @@ class ChangeNotifier:
                             durations[e.id] = format_duration(td)
                 message = self._build_hourly_report(server_events, since, now,
                                                      sid, durations)
+                has_possibly = any(e.event_type == "possibly_freed" for e in server_events)
                 for user_id in recipients:
                     await send_notification(self.bot, user_id, message)
-                    # Store pending final report only if the catalog hasn't
-                    # recomputed yet — otherwise the quick report already has
-                    # complete data from this recompute and a second message
-                    # would be redundant.
-                    recompute_marker = await settings_repo.get(f"catalog_recompute:{sid}")
-                    if not recompute_marker or recompute_marker == "0":
+                    # Always schedule a final report when there are possibly_freed
+                    # events to confirm. Otherwise skip if the catalog already
+                    # recomputed — quick report data is already complete.
+                    if has_possibly:
                         self._pending_final_reports.setdefault(sid, []).append(
                             (user_id, since, now)
                         )
+                    else:
+                        recompute_marker = await settings_repo.get(f"catalog_recompute:{sid}")
+                        if not recompute_marker or recompute_marker == "0":
+                            self._pending_final_reports.setdefault(sid, []).append(
+                                (user_id, since, now)
+                            )
 
     def _build_hourly_report(self, events, since, now, server_sid=None,
                              ownership_durations: Optional[dict] = None) -> str:

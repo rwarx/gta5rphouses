@@ -573,12 +573,21 @@ class ChangeNotifier:
                 repo = RealEstateRepository(session)
                 events = await repo.get_events_since(since, until=until, server_sid=server_sid)
                 now = datetime.now(timezone.utc)
-            message = self._build_final_report(events, since, now, server_sid)
+                durations = {}
+                for e in events:
+                    if e.event_type == "possibly_freed" and e.old_owner:
+                        td = await repo.get_ownership_duration(
+                            e.object_key, e.old_owner, e.detected_at
+                        )
+                        if td and td.total_seconds() > 0:
+                            durations[e.id] = format_duration(td)
+            message = self._build_final_report(events, since, now, server_sid, durations)
             await send_notification(self.bot, user_id, message)
         except Exception as e:
             logger.debug(f"Failed to send final report for {user_id}: {e}")
 
-    def _build_final_report(self, events, since, now, server_sid=None) -> str:
+    def _build_final_report(self, events, since, now, server_sid=None,
+                            ownership_durations: Optional[dict] = None) -> str:
         """Build «🕐✅ Точные данные» report with accurate data."""
         freed_houses = [e for e in events if e.event_type == "freed" and e.kind == "house"]
         freed_apts = [e for e in events if e.event_type == "freed" and e.kind == "apartment"]
@@ -614,7 +623,10 @@ class ChangeNotifier:
             for e in real_possibly:
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 name = e.name or e.object_key
-                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}")
+                duration = ""
+                if ownership_durations and e.id in ownership_durations:
+                    duration = f" (владел {ownership_durations[e.id]})"
+                lines.append(f"• {kind_ru} {name}: {e.old_owner or '—'} → {e.new_owner or '—'}{duration}")
 
         return "\n".join(lines)
 

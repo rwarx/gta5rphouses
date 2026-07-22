@@ -1920,10 +1920,16 @@ class ApartmentBot:
         today = datetime.now(timezone.utc)
         since = today.replace(hour=0, minute=0, second=0, microsecond=0)
         async with DatabaseSession.get_session_context() as session:
-            from app.database.repository import RealEstateRepository
+            from app.database.repository import RealEstateRepository, SubscriptionRepository
             from app.scraper.realestate_client import sid_to_server_name
             repo = RealEstateRepository(session)
             events = await repo.get_events_since(since, event_types=["freed", "converted"])
+
+            sub_repo = SubscriptionRepository(session)
+            subs = await sub_repo.list_for_user(uid)
+            subscribed_sids = {s.server_sid for s in subs}
+            if subscribed_sids:
+                events = [e for e in events if e.server_sid in subscribed_sids]
 
         if not events:
             await message.answer("📉 Слётов за сегодня не было.", parse_mode="HTML",

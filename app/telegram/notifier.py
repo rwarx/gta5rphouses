@@ -257,8 +257,8 @@ class ChangeNotifier:
             settings_repo = ScraperSettingsRepository(session)
             enabled = await settings_repo.get("hourly_report")
             if enabled is None:
-                await settings_repo.set("hourly_report", "1")
-                enabled = "1"
+                await settings_repo.set("hourly_report", "0")
+                enabled = "0"
             if enabled != "1":
                 self._last_report_hour = hour_key
                 return

@@ -235,6 +235,7 @@ class ApartmentBot:
                 [b("👤 По владельцу", "ask:owners"), b("📜 История ников", "ask:owner_history")],
                 [b("⏱ Срок владения", "act:ownership_durations"),
                  b("⚡ Возможные слёты", "act:possible_frees")],
+                [b("🏠+🏢 Дом + квартира", "act:both_owners")],
                 [b("🌐 Серверы", "act:servers")],
                 [b("⬅️ Назад", "menu:main")],
             ]
@@ -254,7 +255,6 @@ class ApartmentBot:
                 [b("🚨 Краш-статус", "adm:crash_status")],
                 [b("🟢 Краш вкл", "adm:crash_on"), b("🔴 Краш выкл", "adm:crash_off")],
                 [b("🗺 Проверить карту", "adm:map_check")],
-                [b("🏠+🏢 Владельцы и дом и кв", "adm:both")],
                 [b("🔔 Гос-уведомления (вкл/выкл)", "adm:free_notify")],
                 [b("⬅️ Назад", "menu:main")],
             ]
@@ -525,6 +525,7 @@ class ApartmentBot:
             "latest_data": self._latest_data,
             "ownership_durations": self.cmd_ownership_durations,
             "possible_frees": self.cmd_possible_frees,
+            "both_owners": self.cmd_both_owners,
         }
         handler = handlers.get(action)
         if handler:
@@ -560,8 +561,6 @@ class ApartmentBot:
             await self.cmd_crash_off(message, user_id=uid)
         elif action == "map_check":
             await self.cmd_map_check(message, user_id=uid)
-        elif action == "both":
-            await self._cmd_players_with_both(message, user_id=uid)
 
     async def _prompt_input(self, message: Message, state: FSMContext, kind: str) -> None:
         prompts = {
@@ -945,12 +944,23 @@ class ApartmentBot:
         from app.database.repository import RealEstateRepository
         from app.scraper.realestate_client import sid_to_server_name
         from app.telegram.notifier import format_duration
+        from datetime import timedelta
 
         server_name = server_name or sid_to_server_name(sid) or f"sid {sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
             rows = await repo.get_all_current_ownership_durations(sid)
+            # Find owners whose apartment freed recently (last 24h)
+            recent = await repo.get_events_since(
+                since=datetime.utcnow() - timedelta(hours=24),
+                event_types=["freed"],
+                server_sid=sid,
+            )
+            apt_freed_owners = set(
+                e.old_owner for e in recent
+                if e.kind == "apartment" and e.old_owner
+            )
 
         if not rows:
             await message.answer("⏱ Нет данных о времени владения.",
@@ -961,6 +971,20 @@ class ApartmentBot:
         apts = [r for r in rows if r["kind"] == "apartment"]
 
         lines = []
+        # — houses at risk because their owner's apartment freed —
+        if apt_freed_owners:
+            at_risk = [r for r in houses if r["owner_name"] in apt_freed_owners]
+            if at_risk:
+                lines.append("<b>🔴 Дом под риском (квартира уже слетела)</b>")
+                for r in sorted(at_risk, key=lambda x: (x["duration"] or timedelta()).total_seconds()):
+                    dur = r["duration"]
+                    name = r["name"] or f"#{r['unit_id']}"
+                    dur_str = format_duration(dur) if dur else "—"
+                    lines.append(
+                        f"• {name} · 👤 {r['owner_name']} — ⏱ {dur_str}"
+                    )
+                lines.append("")
+
         # — risk groups —
         for label, kind, items in [("🏠 Дома", "house", houses),
                                    ("🏢 Квартиры", "apartment", apts)]:
@@ -2084,13 +2108,19 @@ class ApartmentBot:
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("main"))
 
-    async def _cmd_players_with_both(self, message: Message, user_id: Optional[int] = None) -> None:
-        """TEMPORARY: find owners who have both a house and an apartment."""
-        if not self._is_admin(user_id or message.from_user.id):
+    async def cmd_both_owners(self, message: Message, user_id: Optional[int] = None) -> None:
+        """Show owners who have both a house and an apartment (on the default server)."""
+        uid = user_id or message.from_user.id
+        d_sid, d_name = await self._default_sid_for_user(uid)
+        if not d_sid:
+            await message.answer("⚠️ Сначала выберите сервер.")
             return
         from app.database.repository import RealEstateRepository
         from sqlalchemy import select, func
         from app.database.models import RealEstateObject
+        from app.scraper.realestate_client import sid_to_server_name
+
+        server_name = d_name or sid_to_server_name(d_sid) or f"sid {d_sid}"
 
         async with DatabaseSession.get_session_context() as session:
             repo = RealEstateRepository(session)
@@ -2101,6 +2131,7 @@ class ApartmentBot:
                     func.count().filter(RealEstateObject.kind == "apartment").label("apts"),
                 )
                 .where(
+                    RealEstateObject.server_sid == d_sid,
                     RealEstateObject.is_occupied == True,
                     RealEstateObject.owner_name.isnot(None),
                 )
@@ -2113,13 +2144,14 @@ class ApartmentBot:
             )
             rows = result.all()
         if not rows:
-            await message.answer("Нет игроков с домом и квартирой одновременно.")
+            await message.answer("Нет игроков с домом и квартирой одновременно.",
+                                 reply_markup=self._back_kb("catalog"))
             return
-        lines = [f"<b>Игроки с домом + квартирой ({len(rows)})</b>"]
+        lines = [f"<b>🏠+🏢 Игроки с домом и квартирой · {server_name} ({len(rows)})</b>"]
         for r in rows:
             lines.append(f"• {r.owner_name} — 🏠 {r.houses} · 🏢 {r.apts}")
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
-                                  footer_kb=self._back_kb("admin"))
+                                  footer_kb=self._back_kb("catalog"))
 
     async def cmd_map_check(self, message: Message, user_id: Optional[int] = None) -> None:
         if not self._is_admin(user_id or message.from_user.id):

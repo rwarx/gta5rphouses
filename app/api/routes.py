@@ -316,27 +316,6 @@ async def health_check():
         "service": "GTA5RP Apartment Checker",
     }
 
-@router.get("/admin/longest-ownership")
-async def longest_ownership(db: AsyncSession = Depends(get_db_session)):
-    from app.database.repository import RealEstateRepository
-    from datetime import timezone
-    repo = RealEstateRepository(db)
-    result = []
-    for server_sid in ("09", "11", "20"):
-        durations = await repo.get_all_current_ownership_durations(server_sid)
-        houses = [d for d in durations if d["kind"] == "house"]
-        if houses:
-            longest = max(houses, key=lambda x: (x["duration"].total_seconds() if x["duration"] else 0))
-            result.append({
-                "server_sid": server_sid,
-                "name": longest["name"],
-                "owner": longest["owner_name"],
-                "acquired_at": longest["acquired_at"].isoformat() if longest["acquired_at"] else None,
-                "days": round(longest["duration"].total_seconds() / 86400, 1) if longest["duration"] else None,
-            })
-    return result
-
-
 # ============ RealEstate (catalog source) endpoints ============
 
 @router.get("/realestate/events")

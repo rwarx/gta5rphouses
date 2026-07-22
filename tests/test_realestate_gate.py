@@ -45,6 +45,11 @@ def scheduler(monkeypatch):
         return None
     monkeypatch.setattr(sch, "_save_log", _noop_log)
     _Detector.instances = 0
+    # Stub snapshot methods that require a DB session.
+    async def _noop_snap(*a, **k):
+        return None
+    monkeypatch.setattr(sch, "_maybe_preday_snapshot", _noop_snap)
+    monkeypatch.setattr(sch, "_maybe_postday_diff", _noop_snap)
     return sch
 
 

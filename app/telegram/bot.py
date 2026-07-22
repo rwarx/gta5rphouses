@@ -254,6 +254,7 @@ class ApartmentBot:
                 [b("🚨 Краш-статус", "adm:crash_status")],
                 [b("🟢 Краш вкл", "adm:crash_on"), b("🔴 Краш выкл", "adm:crash_off")],
                 [b("🗺 Проверить карту", "adm:map_check")],
+                [b("🏠+🏢 Владельцы и дом и кв", "adm:both")],
                 [b("🔔 Гос-уведомления (вкл/выкл)", "adm:free_notify")],
                 [b("⬅️ Назад", "menu:main")],
             ]
@@ -559,6 +560,8 @@ class ApartmentBot:
             await self.cmd_crash_off(message, user_id=uid)
         elif action == "map_check":
             await self.cmd_map_check(message, user_id=uid)
+        elif action == "both":
+            await self._cmd_players_with_both(message, user_id=uid)
 
     async def _prompt_input(self, message: Message, state: FSMContext, kind: str) -> None:
         prompts = {
@@ -2080,6 +2083,43 @@ class ApartmentBot:
 
         await self._reply_chunked(message, lines[1:], lines[0] + "\n",
                                   footer_kb=self._back_kb("main"))
+
+    async def _cmd_players_with_both(self, message: Message, user_id: Optional[int] = None) -> None:
+        """TEMPORARY: find owners who have both a house and an apartment."""
+        if not self._is_admin(user_id or message.from_user.id):
+            return
+        from app.database.repository import RealEstateRepository
+        from sqlalchemy import select, func
+        from app.database.models import RealEstateObject
+
+        async with DatabaseSession.get_session_context() as session:
+            repo = RealEstateRepository(session)
+            result = await session.execute(
+                select(
+                    RealEstateObject.owner_name,
+                    func.count().filter(RealEstateObject.kind == "house").label("houses"),
+                    func.count().filter(RealEstateObject.kind == "apartment").label("apts"),
+                )
+                .where(
+                    RealEstateObject.is_occupied == True,
+                    RealEstateObject.owner_name.isnot(None),
+                )
+                .group_by(RealEstateObject.owner_name)
+                .having(
+                    func.count().filter(RealEstateObject.kind == "house") >= 1,
+                    func.count().filter(RealEstateObject.kind == "apartment") >= 1,
+                )
+                .order_by(RealEstateObject.owner_name)
+            )
+            rows = result.all()
+        if not rows:
+            await message.answer("Нет игроков с домом и квартирой одновременно.")
+            return
+        lines = [f"<b>Игроки с домом + квартирой ({len(rows)})</b>"]
+        for r in rows:
+            lines.append(f"• {r.owner_name} — 🏠 {r.houses} · 🏢 {r.apts}")
+        await self._reply_chunked(message, lines[1:], lines[0] + "\n",
+                                  footer_kb=self._back_kb("admin"))
 
     async def cmd_map_check(self, message: Message, user_id: Optional[int] = None) -> None:
         if not self._is_admin(user_id or message.from_user.id):

@@ -7,6 +7,7 @@ import asyncio
 import re
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from aiogram import Bot
@@ -47,6 +48,14 @@ def _is_nickname_change(old_owner: Optional[str], new_owner: Optional[str]) -> b
 
     if not f1 or not f2:
         return False
+
+
+def _fmt_period(since: datetime, until: datetime) -> str:
+    """Format a time range in the configured timezone."""
+    tz = ZoneInfo(get_settings().timezone)
+    s_local = since.astimezone(tz)
+    u_local = until.astimezone(tz)
+    return f"{s_local.strftime('%H:%M')}–{u_local.strftime('%H:%M')} {s_local.tzname() or '+00'}"
 
     # Same first name → same character, just changed family name
     if f1 == f2:
@@ -322,7 +331,7 @@ class ChangeNotifier:
         ]
         nick_changes = len(possibly) - len(real_possibly)
 
-        period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
+        period = _fmt_period(since, now)
         server = sid_to_server_name(server_sid) if server_sid else None
         header = "🕐 <b>Быстрый отчёт</b>"
         if server:
@@ -608,7 +617,7 @@ class ChangeNotifier:
         ]
         nick_changes = len(possibly) - len(real_possibly)
 
-        period = f"{since.strftime('%H:%M')}–{now.strftime('%H:%M')} UTC"
+        period = _fmt_period(since, now)
         server = sid_to_server_name(server_sid) if server_sid else None
         header = "🕐✅ <b>Точные данные</b>"
         if server:

@@ -22,14 +22,15 @@ before a clean freed->occupied pair could be observed. Every owner change is
 also appended to RealEstateOwnerHistory so the nickname timeline is preserved.
 """
 
-from typing import List, Dict, Any, Optional
+import json
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.repository import RealEstateRepository
+from app.database.repository import RealEstateRepository, ScraperSettingsRepository
 from app.scraper.realestate_client import RealEstateSnapshot, RealEstateUnit
 
 
@@ -188,6 +189,12 @@ class RealEstateDetector:
             f"{len(current)} occupied now, {len(previous)} before"
             + (" [first run, baseline only]" if is_first_run else "")
         )
+
+        # ---- Secondary check: track free (vacant) objects by ownerName ----
+        if not is_first_run:
+            extra = await self._check_free_keys(snapshot, server_sid, changes)
+            changes.extend(extra)
+
         return changes
 
     async def generate_snapshot_diff_frees(
@@ -248,6 +255,67 @@ class RealEstateDetector:
             logger.info(
                 f"RealEstate snapshot-diff (server {server_sid}): "
                 f"{len(changes)} confirmed freed"
+            )
+        return changes
+
+    async def _check_free_keys(
+        self, snapshot: RealEstateSnapshot, server_sid: str,
+        main_changes: List[RealEstateChange],
+    ) -> List[RealEstateChange]:
+        current_free: Set[str] = set()
+        free_unit_map: Dict[str, RealEstateUnit] = {}
+        for unit in [*snapshot.houses, *snapshot.apartments]:
+            if unit.unit_id is not None and not unit.owner_name:
+                key = self.repo.make_key(server_sid, unit.kind, unit.unit_id)
+                current_free.add(key)
+                free_unit_map[key] = unit
+
+        settings = ScraperSettingsRepository(self.session)
+        prev_raw = await settings.get(f"free_keys:{server_sid}")
+        prev_free: Set[str] = set(json.loads(prev_raw)) if prev_raw else set()
+
+        if not prev_free:
+            await settings.set(
+                f"free_keys:{server_sid}", json.dumps(list(current_free))
+            )
+            return []
+
+        newly_free = current_free - prev_free
+        await settings.set(
+            f"free_keys:{server_sid}", json.dumps(list(current_free))
+        )
+
+        if not newly_free:
+            return []
+
+        # Skip keys the main diff already handled
+        already_handled = {c.object_key for c in main_changes
+                           if c.event_type in ("freed", "possibly_freed")}
+        newly_free -= already_handled
+
+        if not newly_free:
+            return []
+
+        changes: List[RealEstateChange] = []
+        for key in newly_free:
+            try:
+                unit = free_unit_map[key]
+                data = self._event_data(server_sid, unit, "freed")
+                await self.repo.create_event(data)
+                await self.repo.mark_freed(key)
+                changes.append(RealEstateChange(
+                    object_key=key, event_type="freed",
+                    kind=unit.kind, name=unit.name or "",
+                ))
+            except Exception as e:
+                logger.error(f"Failed to process free key {key}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to process free key {key}: {e}")
+
+        if changes:
+            logger.info(
+                f"RealEstate free-keys (server {server_sid}): "
+                f"{len(changes)} newly vacant object(s)"
             )
         return changes
 

@@ -705,7 +705,7 @@ class ApartmentBot:
     async def cmd_realestate(self, message: Message, user_id: Optional[int] = None) -> None:
         """Show the /realestate source status and recent freed objects."""
         from app.database.repository import RealEstateRepository
-        from app.scraper.realestate_client import resolve_servers
+        from app.scraper.realestate_client import resolve_servers, sid_to_server_name
 
         rs = self.settings.realestate
         servers = resolve_servers(rs.server_names)
@@ -736,7 +736,7 @@ class ApartmentBot:
                 when = e.detected_at.strftime("%d.%m %H:%M") if e.detected_at else "—"
                 kind_ru = "дом" if e.kind == "house" else "кв."
                 price = f" · {e.price:,}".replace(",", " ") if e.price else ""
-                srv = servers.get(e.server_sid)
+                srv = sid_to_server_name(e.server_sid) if e.server_sid else None
                 srv_tag = f"[{srv}] " if srv else ""
                 lines.append(f"• {srv_tag}{when} — {kind_ru} {e.name or e.object_key}{price}")
         else:
